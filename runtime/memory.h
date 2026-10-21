@@ -10,6 +10,9 @@
 /* Backing store for the Dreamcast's 16 MiB main RAM. */
 extern uint8_t dc_ram[DC_RAM_SIZE];
 
+/* Address of the most recent access that hit unimplemented hardware. */
+extern uint32_t mem_last_unmapped;
+
 void mem_init(void);
 int mem_load_bin(const char *path, uint32_t address, char *err, size_t err_size);
 

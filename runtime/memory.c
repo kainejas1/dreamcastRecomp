@@ -4,6 +4,7 @@
 #include <string.h>
 
 uint8_t dc_ram[DC_RAM_SIZE];
+uint32_t mem_last_unmapped;
 
 void mem_init(void)
 {
@@ -72,6 +73,7 @@ static void log_unmapped(const char *op, uint32_t address, uint32_t value, int w
 {
     // games poll hardware in tight loops, don't drown the console
     static unsigned logged;
+    mem_last_unmapped = address;
     if (logged >= 500) return;
     if (++logged == 500) {
         fprintf(stderr, "[hw] ... more unimplemented accesses, not logging them\n");
