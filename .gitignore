@@ -1,0 +1,17 @@
+# Build output
+build/
+
+# Game data and anything derived from it: never commit.
+# out/ holds the C code the emitter generates from the game; it is Sega's
+# program in another language, not ours to publish.
+extracted/
+out/
+Sonic Adventure 2*/
+*.elf
+*.bin
+*.BIN
+*.cue
+*.cdi
+*.gdi
+*.chd
+*.iso
