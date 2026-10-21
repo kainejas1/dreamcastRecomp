@@ -2,12 +2,14 @@
  * Runtime entry point: loads the game into RAM, sets the CPU up the way the
  * boot ROM leaves it, and calls the recompiled entry point.
  *
- *   sa2 <1ST_READ.BIN> [IP.BIN]
+ *   sa2 <1ST_READ.BIN> [IP.BIN] [disc.cue]
  *
  * No hardware yet. Accesses to it are logged by memory.c, and the run stops
  * with a report when it hits something it can't go past.
  */
 
+#include "bios.h"
+#include "gdrom.h"
 #include "memory.h"
 #include "sh4_rt.h"
 
@@ -64,6 +66,7 @@ static uint32_t to_p1(uint32_t addr)
 
 void dc_call(sh4_ctx *ctx, uint32_t addr)
 {
+    if (bios_call(ctx, addr)) return;   // syscall vectors point at BIOS hooks
     sh4_func f = dc_lookup(to_p1(addr));
     if (!f)
         stop(ctx, "call to %08x, no recompiled function there (called from around pr=%08x)", addr, ctx->pr);
@@ -72,6 +75,7 @@ void dc_call(sh4_ctx *ctx, uint32_t addr)
 
 void dc_jump(sh4_ctx *ctx, uint32_t addr)
 {
+    if (bios_call(ctx, addr)) return;   // syscall stubs jmp through the vectors
     sh4_func f = dc_lookup(to_p1(addr));
     if (!f)
         stop(ctx, "jump to %08x, no recompiled function there", addr);
@@ -134,10 +138,15 @@ int main(int argc, char **argv)
     char err[256];
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s 1ST_READ.BIN [IP.BIN]\n", argv[0]);
+        fprintf(stderr, "usage: %s 1ST_READ.BIN [IP.BIN] [disc.cue]\n", argv[0]);
         return 2;
     }
     mem_init();
+    bios_init();   // before loading: it fills low RAM, IP.BIN goes on top
+    if (argc > 3 && !gd_open(argv[3], err, sizeof err)) {
+        fprintf(stderr, "error: %s\n", err);
+        return 1;
+    }
     if (!mem_load_bin(argv[1], DC_RAM_LOAD_BASE, err, sizeof err)) {
         fprintf(stderr, "error: %s\n", err);
         return 1;
@@ -148,12 +157,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // what the boot ROM hands over to 1ST_READ.BIN: privileged mode, register
-    // bank 1, interrupts masked, round-to-zero FPU, stack top at 8c00f400
-    cpu.sr = 0x600000f0u;
+    // what the boot ROM hands over (values from Flycast's HLE BIOS): privileged
+    // mode, interrupts masked, round-to-zero FPU, stack at the top of RAM
+    cpu.sr = 0x400000f0u;
     cpu.fpscr = 0x00040001u;
-    cpu.r[15] = 0x8c00f400u;
+    cpu.r[15] = 0x8d000000u;
+    cpu.gbr = 0x8c000000u;
     cpu.vbr = 0x8c000000u;
+    cpu.dbr = 0x8c000010u;
+    cpu.sgr = 0x8d000000u;
 
     fprintf(stderr, "starting at 8c010000 (%d recompiled functions)\n", dc_func_count);
     f_8c010000(&cpu);
