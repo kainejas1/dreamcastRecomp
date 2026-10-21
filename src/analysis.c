@@ -402,8 +402,25 @@ static int drain(ctx *c)
 
 /* ---- discovery passes; each returns functions added, or -1 on error ---- */
 
+/* pc is where a function could start: right after an unconditional jump or
+ * return and its delay slot, or right after a literal pool (nop padding in
+ * between is fine). */
+static int at_function_boundary(const dc_analysis *a, uint32_t pc)
+{
+    uint16_t raw;
+    sh4_insn in;
+    while (in_range(a, pc - 2, 2) && a->kind[index_of(a, pc - 2)] == BYTE_UNKNOWN &&
+           dc_read16(a->img, pc - 2, &raw) && raw == 0x0009)
+        pc -= 2;
+    if (!in_range(a, pc - 4, 2)) return 0;
+    if (a->kind[index_of(a, pc - 2)] == BYTE_DATA) return 1;
+    if (a->kind[index_of(a, pc - 2)] != BYTE_CODE) return 0;
+    return read_insn(a, pc - 4, &in) && (in.flags & F_DELAY) && !(in.flags & (F_CALL | F_COND));
+}
+
 /* Aligned words that point at untraced code: literal-pool words (usually
- * callbacks) or any word whose target starts with a prologue. */
+ * callbacks), or any word whose target starts with a prologue or sits at a
+ * function boundary (tables of handlers, e.g. 8c17aa94 -> 8c1102c4). */
 static int scan_pointers(ctx *c)
 {
     dc_analysis *a = c->a;
@@ -416,7 +433,7 @@ static int scan_pointers(ctx *c)
         if (!dc_read32(a->img, p, &value) || !in_range(a, value, 2)) continue;
         if (a->kind[index_of(a, value)] != BYTE_UNKNOWN || !dc_read16(a->img, value, &raw)) continue;
         int is_literal = a->kind[ix] == BYTE_DATA && a->kind[ix + 1] == BYTE_DATA;
-        if (!is_literal && !is_prologue(raw)) continue;
+        if (!is_literal && !is_prologue(raw) && !at_function_boundary(a, value)) continue;
         if (!looks_like_code(a, value)) continue;
         int before = a->nfuncs;
         if (!add_func(c, value, FUNC_FROM_PTR)) return -1;
