@@ -53,6 +53,30 @@ void dc_jump(sh4_ctx *ctx, uint32_t addr);
 /* An instruction the emitter has no translation for. */
 void dc_unhandled(sh4_ctx *ctx, uint32_t pc, uint16_t raw);
 
+/* ---- the game's setjmp/longjmp (dcrecomp emit --setjmp/--longjmp) ----
+ * Games use them to switch between threads, each on its own stack. A C call
+ * can't return twice, so every game thread runs on its own host fiber, and
+ * each setjmp call site also takes a host setjmp for longjmp to come back to.
+ * See coro.c. */
+#if defined(__GNUC__)
+typedef void *dc_jmpbuf[5];
+#define DC_HOST_SETJMP(b) __builtin_setjmp(b)
+#else
+#include <setjmp.h>
+typedef jmp_buf dc_jmpbuf;
+#define DC_HOST_SETJMP(b) setjmp(b)
+#endif
+
+/* after the game's setjmp ran on buf: remember where we are */
+dc_jmpbuf *dc_setjmp_here(sh4_ctx *ctx, uint32_t buf);
+/* after the game's longjmp loaded its registers from buf: go there. Doesn't return */
+void dc_longjmp(sh4_ctx *ctx, uint32_t buf);
+
+/* buf is the first argument (r4); the game's code changes r4 */
+#define DC_SETJMP(ctx, fn) do { uint32_t b_ = (ctx)->r[4]; fn(ctx); \
+    dc_jmpbuf *j_ = dc_setjmp_here(ctx, b_); DC_HOST_SETJMP(*j_); } while (0)
+#define DC_LONGJMP(ctx, fn) do { uint32_t b_ = (ctx)->r[4]; fn(ctx); dc_longjmp(ctx, b_); } while (0)
+
 /* ---- interrupts ---- */
 
 extern volatile int dc_irq_pending;

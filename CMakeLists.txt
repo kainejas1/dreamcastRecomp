@@ -26,6 +26,7 @@ if(DC_GAME_SRC)
     runtime/main.c
     runtime/aica.c
     runtime/bios.c
+    runtime/coro.c
     runtime/gdrom.c
     runtime/holly.c
     runtime/memory.c
