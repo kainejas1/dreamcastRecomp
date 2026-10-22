@@ -24,6 +24,7 @@ file(GLOB DC_GAME_SRC CONFIGURE_DEPENDS ${DC_GAME_DIR}/*.c)
 if(DC_GAME_SRC)
   add_executable(sa2
     runtime/main.c
+    runtime/aica.c
     runtime/bios.c
     runtime/gdrom.c
     runtime/holly.c

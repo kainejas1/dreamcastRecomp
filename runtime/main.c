@@ -8,6 +8,7 @@
  * with a report when it hits something it can't go past.
  */
 
+#include "aica.h"
 #include "bios.h"
 #include "gdrom.h"
 #include "holly.h"
@@ -118,6 +119,7 @@ void dc_service_irq(sh4_ctx *ctx)
 
     if (max_frames && holly_frame_count() >= max_frames)
         stop(ctx, "ran %u frames (DC_FRAMES), %llu interrupts taken", holly_frame_count(), interrupts);
+    aica_update();
 
     int level = holly_pending_level();
     uint32_t sr = sh4_get_sr(ctx);
@@ -169,9 +171,8 @@ static void summary(void)
 void sh4_pref(sh4_ctx *ctx, uint32_t addr)
 {
     (void)ctx;
-    static int warned;
-    if ((addr & 0xfc000000u) == 0xe0000000u && !warned++)
-        fprintf(stderr, "[hw] store queue flush (pref %08x) not implemented yet\n", addr);
+    if ((addr & 0xfc000000u) == 0xe0000000u)
+        mem_sq_flush(addr);
 }
 
 void sh4_trapa(sh4_ctx *ctx, uint32_t imm, uint32_t pc)

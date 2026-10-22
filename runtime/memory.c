@@ -1,4 +1,5 @@
 #include "memory.h"
+#include "aica.h"
 #include "holly.h"
 
 #include <stdio.h>
@@ -6,7 +7,20 @@
 
 uint8_t dc_ram[DC_RAM_SIZE];
 uint8_t dc_vram[DC_VRAM_SIZE];
+uint8_t dc_aram[DC_ARAM_SIZE];
 uint32_t mem_last_unmapped;
+
+/* Sound RAM: physical 00800000-00ffffff, 2 MiB mirrored. */
+static int aram_offset(uint32_t address, size_t length, size_t *offset)
+{
+    if (address >= 0xe0000000u) return 0;
+    uint32_t phys = address & 0x1fffffffu;
+    if (phys < 0x00800000u || phys >= 0x01000000u) return 0;
+    uint32_t a = phys & (DC_ARAM_SIZE - 1);
+    if (length > DC_ARAM_SIZE - a) return 0;
+    *offset = a;
+    return 1;
+}
 
 /* Video RAM is area 1 (physical 04000000-07ffffff). 05/07 is the 32-bit
    path: linear. 04/06 is the 64-bit path: the two 4 MiB banks interleaved
@@ -24,10 +38,27 @@ static int vram_offset(uint32_t address, size_t *offset)
     return 1;
 }
 
+/* SH-4 store queues: two 32-byte buffers written through e0000000-e3ffffff
+   (address bit 5 picks the queue). pref sends one out in a single burst, to
+   the area in QACR0/QACR1 plus the low address bits. Used for the TA FIFO
+   and for fast copies/fills. */
+static uint32_t store_queue[2][8];
+
+void mem_sq_flush(uint32_t address)
+{
+    unsigned q = (address >> 5) & 1u;
+    uint32_t qacr = sh4reg_read32(q ? 0xff00003cu : 0xff000038u);
+    uint32_t dest = ((qacr & 0x1cu) << 24) | (address & 0x03ffffe0u);
+
+    for (unsigned i = 0; i < 8; i++)
+        mem_w32(dest + i * 4u, store_queue[q][i]);
+}
+
 void mem_init(void)
 {
     memset(dc_ram, 0, sizeof dc_ram);
     holly_init();
+    aica_init();
 }
 
 /* P0/P1/P2 aliases of the 0x0c000000 main-RAM window map to the
@@ -129,13 +160,16 @@ static uint32_t reg_address(uint32_t address)
 
 static int is_register(uint32_t address)
 {
-    return holly_handles(reg_address(address)) || sh4reg_handles(address);
+    return holly_handles(reg_address(address)) || aica_handles(reg_address(address))
+        || sh4reg_handles(address);
 }
 
 static uint32_t register_read32(uint32_t address)
 {
     if (holly_handles(reg_address(address)))
         return holly_read32(reg_address(address));
+    if (aica_handles(reg_address(address)))
+        return aica_read32(reg_address(address));
 
     return sh4reg_read32(address);
 }
@@ -144,6 +178,8 @@ static void register_write32(uint32_t address, uint32_t value)
 {
     if (holly_handles(reg_address(address)))
         holly_write32(reg_address(address), value);
+    else if (aica_handles(reg_address(address)))
+        aica_write32(reg_address(address), value);
     else
         sh4reg_write32(address, value);
 }
@@ -189,6 +225,9 @@ uint8_t mem_r8(uint32_t address)
     if (vram_offset(address, &o))
         return dc_vram[o];
 
+    if (aram_offset(address, 1, &o))
+        return dc_aram[o];
+
     if (is_register(address)) {
         return (uint8_t)(
             register_read32(address & ~3u)
@@ -212,6 +251,9 @@ uint16_t mem_r16(uint32_t address)
 
     if (vram_offset(address, &o))
         return (uint16_t)(dc_vram[o] | ((uint16_t)dc_vram[o + 1] << 8));
+
+    if (aram_offset(address, 2, &o))
+        return (uint16_t)(dc_aram[o] | ((uint16_t)dc_aram[o + 1] << 8));
 
     if (is_register(address)) {
         return (uint16_t)(
@@ -241,6 +283,12 @@ uint32_t mem_r32(uint32_t address)
         return v;
     }
 
+    if (aram_offset(address, 4, &o)) {
+        uint32_t v;
+        memcpy(&v, &dc_aram[o], 4);
+        return v;
+    }
+
     if (is_register(address))
         return register_read32(address & ~3u);
 
@@ -262,11 +310,16 @@ void mem_w8(uint32_t address, uint8_t value)
         return;
     }
 
+    if (aram_offset(address, 1, &o)) {
+        dc_aram[o] = value;
+        return;
+    }
+
     if (is_register(address)) {
         uint32_t a = address & ~3u;
         uint32_t shift = (address & 3u) * 8u;
 
-        if (reg_address(a) == HOLLY_SB_ISTNRM) {
+        if (reg_address(a) == HOLLY_SB_ISTNRM || reg_address(a) == HOLLY_SB_ISTERR) {
             register_write32(a, (uint32_t)value << shift);
         } else {
             uint32_t old = register_read32(a);
@@ -299,11 +352,16 @@ void mem_w16(uint32_t address, uint16_t value)
         return;
     }
 
+    if (aram_offset(address, 2, &o)) {
+        memcpy(&dc_aram[o], &value, 2);
+        return;
+    }
+
     if (is_register(address)) {
         uint32_t a = address & ~3u;
         uint32_t shift = (address & 2u) * 8u;
 
-        if (reg_address(a) == HOLLY_SB_ISTNRM) {
+        if (reg_address(a) == HOLLY_SB_ISTNRM || reg_address(a) == HOLLY_SB_ISTERR) {
             register_write32(a, (uint32_t)value << shift);
         } else {
             uint32_t old = register_read32(a);
@@ -335,6 +393,16 @@ void mem_w32(uint32_t address, uint32_t value)
 
     if (vram_offset(address, &o)) {
         memcpy(&dc_vram[o], &value, 4);
+        return;
+    }
+
+    if (aram_offset(address, 4, &o)) {
+        memcpy(&dc_aram[o], &value, 4);
+        return;
+    }
+
+    if ((address & 0xfc000000u) == 0xe0000000u) {
+        store_queue[(address >> 5) & 1u][(address >> 2) & 7u] = value;
         return;
     }
 

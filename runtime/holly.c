@@ -1,4 +1,5 @@
 #include "holly.h"
+#include "memory.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -214,23 +215,56 @@ uint32_t holly_read32(uint32_t address)
     return v;
 }
 
+// G2 DMA: main RAM <-> G2 bus (sound RAM, expansion). 4 channels 0x20 apart:
+// +0 STAG (G2 address), +4 STAR (system RAM), +8 LEN, +c DIR, +10 TSEL,
+// +14 EN, +18 ST (start / busy), +1c SUSP. Done at once when started.
+#define G2_DMA_BASE 0x005f7800u
+
+static void g2_dma(unsigned ch)
+{
+    uint32_t *r = &holly_regs[(G2_DMA_BASE + ch * 0x20u - HOLLY_REG_BASE) / 4u];
+    uint32_t g2 = r[0] & 0x1fffffe0u, sys = r[1] & 0x1fffffe0u, len = r[2] & 0x7fffffe0u;
+    int to_ram = r[3] & 1;
+
+    for (uint32_t i = 0; i < len; i += 4) {
+        if (to_ram) mem_w32(sys + i, mem_r32(g2 + i));
+        else        mem_w32(g2 + i, mem_r32(sys + i));
+    }
+    REGLOG("[reg] G2 DMA ch%u: %u bytes %08x %s %08x\n", ch, len, sys, to_ram ? "<-" : "->", g2);
+
+    r[0] = g2 + len;
+    r[1] = sys + len;
+    if (r[2] & 0x80000000u) r[5] = 0;   // LEN bit 31: clear EN when done
+    r[6] = 0;                            // not busy any more
+    holly_regs[(HOLLY_SB_ISTNRM - HOLLY_REG_BASE) / 4u] |= 1u << (15 + ch);   // DMA end interrupt
+}
+
 void holly_write32(uint32_t address, uint32_t value)
 {
     if (!holly_handles(address) || (address & 3u))
         return;
 
-    if (address == HOLLY_SB_ISTNRM) {
+    if (address == HOLLY_SB_ISTNRM || address == HOLLY_SB_ISTERR) {
         /* Interrupt status is write-one-to-clear. */
         size_t i = (address - HOLLY_REG_BASE) / 4u;
 
         holly_regs[i] &= ~value;
-        pending_status &= ~value;
+        if (address == HOLLY_SB_ISTNRM) pending_status &= ~value;
         REGLOG("[reg] w %08x <- %08x (ack)\n", address, value);
         return;
     }
+    if (address == HOLLY_SB_ISTEXT)   // read only: follows the external lines (GD-ROM, AICA, ...)
+        return;
 
     holly_regs[(address - HOLLY_REG_BASE) / 4u] = value;
     REGLOG("[reg] w %08x <- %08x\n", address, value);
+
+    // G2 DMA start: channel enabled and ST written with 1
+    if (address >= G2_DMA_BASE && address < G2_DMA_BASE + 0x80u && (address & 0x1fu) == 0x18u && (value & 1)) {
+        unsigned ch = (address - G2_DMA_BASE) / 0x20u;
+        if (holly_regs[(G2_DMA_BASE + ch * 0x20u + 0x14u - HOLLY_REG_BASE) / 4u] & 1)
+            g2_dma(ch);
+    }
 
     if (address == HOLLY_SPG_LOAD) {
         uint32_t lines = (value >> 16) & 0x3ffu;
