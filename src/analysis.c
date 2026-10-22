@@ -495,6 +495,8 @@ static int at_function_boundary(const dc_analysis *a, uint32_t pc)
 /* Aligned words that point at untraced code: literal-pool words (usually
  * callbacks), or any word whose target starts with a prologue or sits at a
  * function boundary (tables of handlers, e.g. 8c17aa94 -> 8c1102c4). */
+static int follows_return(const dc_analysis *a, uint32_t pc);
+
 static int scan_pointers(ctx *c)
 {
     dc_analysis *a = c->a;
@@ -504,7 +506,15 @@ static int scan_pointers(ctx *c)
         uint32_t value;
         uint16_t raw;
         if (a->kind[ix] == BYTE_CODE) continue;
-        if (!dc_read32(a->img, p, &value) || !in_range(a, value, 2)) continue;
+        if (!dc_read32(a->img, p, &value) || !in_range(a, value, 2) || (value & 1)) continue;
+        // already traced inside another function (it got there with a bra),
+        // but right after an rts/jmp and pointed to from data: a function
+        // of its own too (SA2's 8c104472, in a table at 8c17eb04)
+        if (a->kind[index_of(a, value)] == BYTE_CODE && !c->func_at[index_of(a, value)] && follows_return(a, value)) {
+            if (!add_func(c, value, FUNC_FROM_PTR)) return -1;
+            added++;
+            continue;
+        }
         if (a->kind[index_of(a, value)] != BYTE_UNKNOWN || !dc_read16(a->img, value, &raw)) continue;
         int is_literal = a->kind[ix] == BYTE_DATA && a->kind[ix + 1] == BYTE_DATA;
         if (!is_literal && !is_prologue(raw) && !at_function_boundary(a, value)) continue;
@@ -556,8 +566,9 @@ static int scan_gaps(ctx *c)
 static int follows_return(const dc_analysis *a, uint32_t pc)
 {
     sh4_insn in;
+    // rts, or a tail jump (jmp @Rn): either way the function ended there
     return in_range(a, pc - 4, 2) && read_insn(a, pc - 4, &in) &&
-           (in.flags & F_RETURN) && (in.flags & F_DELAY);
+           ((in.flags & F_RETURN) || in.op == SH4_OP_JMP) && (in.flags & F_DELAY);
 }
 
 /* Untraced space inside a function with an unresolved jump is most likely
