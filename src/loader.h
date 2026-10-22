@@ -27,11 +27,18 @@ typedef struct {
     int nregions;
     dc_symbol *syms;       /* sorted by addr */
     int nsyms;
+    uint32_t *roots;       /* extra function starts (copied code), besides entry */
+    int nroots;
 } dc_image;
 
 int  dc_load_elf(dc_image *img, const char *path, char *err, size_t errlen);
 int  dc_load_bin(dc_image *img, const char *path, uint32_t base, char *err, size_t errlen);
 void dc_image_free(dc_image *img);
+
+/* Code the game copies somewhere else at runtime (e.g. exception stubs into
+ * the vector area): put `len` bytes from `src` at `dest` too, so they get
+ * analysed and recompiled at the address they run from. */
+int  dc_image_copy(dc_image *img, uint32_t dest, uint32_t src, uint32_t len, char *err, size_t errlen);
 
 /* Translate a virtual address to an offset into img->ram. Returns 0 if
  * the address is not in main RAM. */

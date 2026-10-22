@@ -24,9 +24,13 @@ static void usage(void)
         "  --start ADDR     only disassemble from ADDR\n"
         "  --end ADDR       only disassemble up to ADDR (exclusive)\n"
         "  --out DIR        emit: output directory (default out)\n"
-        "  --only ADDR      emit: just the function at ADDR, to stdout\n",
+        "  --only ADDR      emit: just the function at ADDR, to stdout\n"
+        "  --copy D=S,LEN   code the game copies to D from S at runtime; recompile it at D\n"
+        "                   (repeatable)\n",
         DC_DEFAULT_BASE);
 }
+
+#define MAX_COPIES 16
 
 typedef struct {
     const char *path;
@@ -34,6 +38,8 @@ typedef struct {
     uint32_t base, start, end;
     const char *out_dir;   /* emit */
     uint32_t only;         /* emit */
+    struct { uint32_t dest, src, len; } copies[MAX_COPIES];
+    int ncopies;
 } options;
 
 static int parse_options(int argc, char **argv, options *o)
@@ -49,6 +55,16 @@ static int parse_options(int argc, char **argv, options *o)
         else if (!strcmp(a, "--end") && i + 1 < argc) o->end = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(a, "--out") && i + 1 < argc) o->out_dir = argv[++i];
         else if (!strcmp(a, "--only") && i + 1 < argc) o->only = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--copy") && i + 1 < argc && o->ncopies < MAX_COPIES) {
+            // DEST=SRC,LEN, e.g. 0x8c000600=0x8c15ab44,0x60
+            char *p = argv[++i], *end;
+            o->copies[o->ncopies].dest = (uint32_t)strtoul(p, &end, 0);
+            if (*end != '=') { fprintf(stderr, "bad --copy %s\n", p); return 0; }
+            o->copies[o->ncopies].src = (uint32_t)strtoul(end + 1, &end, 0);
+            if (*end != ',') { fprintf(stderr, "bad --copy %s\n", p); return 0; }
+            o->copies[o->ncopies].len = (uint32_t)strtoul(end + 1, NULL, 0);
+            o->ncopies++;
+        }
         else if (a[0] != '-' && !o->path) o->path = a;
         else { fprintf(stderr, "unknown option: %s\n", a); return 0; }
     }
@@ -61,6 +77,8 @@ static int load(const options *o, dc_image *img)
     char err[256];
     int ok = o->raw_bin ? dc_load_bin(img, o->path, o->base, err, sizeof err)
                         : dc_load_elf(img, o->path, err, sizeof err);
+    for (int i = 0; ok && i < o->ncopies; i++)
+        ok = dc_image_copy(img, o->copies[i].dest, o->copies[i].src, o->copies[i].len, err, sizeof err);
     if (!ok) fprintf(stderr, "error: %s\n", err);
     return ok;
 }

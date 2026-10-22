@@ -217,10 +217,24 @@ const char *dc_symbol_at(const dc_image *img, uint32_t addr)
     return NULL;
 }
 
+int dc_image_copy(dc_image *img, uint32_t dest, uint32_t src, uint32_t len, char *err, size_t errlen)
+{
+    uint32_t so, d;
+    if (!len || (dest & 1) || !dc_ram_offset(src, &so) || !dc_ram_offset(dest, &d) ||
+        (uint64_t)so + len > DC_RAM_SIZE || (uint64_t)d + len > DC_RAM_SIZE)
+        return fail(err, errlen, "bad copy %08x=%08x,%x", dest, src, len);
+    memmove(img->ram + d, img->ram + so, len);
+    add_region(img, dest, dest + len, "copy");
+    img->roots = realloc(img->roots, (size_t)(img->nroots + 1) * sizeof *img->roots);
+    img->roots[img->nroots++] = dest;
+    return 1;
+}
+
 void dc_image_free(dc_image *img)
 {
     for (int i = 0; i < img->nsyms; i++) free(img->syms[i].name);
     free(img->syms);
+    free(img->roots);
     free(img->regions);
     free(img->ram);
     memset(img, 0, sizeof *img);
