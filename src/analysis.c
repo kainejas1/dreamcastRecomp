@@ -115,8 +115,10 @@ static int writes_reg(const sh4_insn *in, unsigned reg)
  * come from mov.l/mov.w PC-relative literals, mov #imm and mova. */
 static int resolve_reg(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t *value)
 {
+    uint32_t delta = 0;   /* add #imm / @-Rn / @Rm+ steps between the source and pc */
+
     for (unsigned k = 1; k <= MAX_BACK; k++) {
-        uint32_t p = pc - 2u * k;
+        uint32_t p = pc - 2u * k, v;
         sh4_insn in;
         uint16_t w;
         if (!in_range(a, p, 2) || !read_insn(a, p, &in) || in.op == SH4_OP_UNKNOWN) return 0;
@@ -125,25 +127,91 @@ static int resolve_reg(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t
         if (!writes_reg(&in, reg)) continue;
         switch (in.op) {
         case SH4_OP_MOVL_PC:
-            return dc_read32(a->img, in.target, value);
+            if (dc_literal_written(a, in.target) || !dc_read32(a->img, in.target, &v)) return 0;
+            *value = v + delta;
+            return 1;
         case SH4_OP_MOVW_PC:
-            if (!dc_read16(a->img, in.target, &w)) return 0;
-            *value = (uint32_t)(int32_t)(int16_t)w;
+            if (dc_literal_written(a, in.target) || !dc_read16(a->img, in.target, &w)) return 0;
+            *value = (uint32_t)(int32_t)(int16_t)w + delta;
             return 1;
         case SH4_OP_MOV_I:
-            *value = (uint32_t)in.imm;
+            *value = (uint32_t)in.imm + delta;
             return 1;
         case SH4_OP_MOVA:
-            *value = in.target;
+            *value = in.target + delta;
             return 1;
         case SH4_OP_MOV:
             reg = in.m;   /* a copy: keep looking for Rm */
+            continue;
+        case SH4_OP_ADD_I:
+            delta += (uint32_t)in.imm;
+            continue;
+        /* the register was only stepped as an address (mova X,r0 ; mov.l r1,@-r0) */
+        case SH4_OP_MOVB_SDEC: case SH4_OP_MOVW_SDEC: case SH4_OP_MOVL_SDEC:
+            delta -= in.op == SH4_OP_MOVB_SDEC ? 1 : in.op == SH4_OP_MOVW_SDEC ? 2 : 4;
+            continue;
+        case SH4_OP_MOVB_LINC: case SH4_OP_MOVW_LINC: case SH4_OP_MOVL_LINC:
+            if (in.n == reg) return 0;   // the loaded value, not the stepped address
+            delta += in.op == SH4_OP_MOVB_LINC ? 1 : in.op == SH4_OP_MOVW_LINC ? 2 : 4;
             continue;
         default:
             return 0;     /* computed value */
         }
     }
     return 0;
+}
+
+int dc_literal_written(const dc_analysis *a, uint32_t addr)
+{
+    addr &= ~1u;
+    return a->written && in_range(a, addr, 2) && a->written[index_of(a, addr)];
+}
+
+/* Where a store writes, if the address can be worked out statically. The
+ * address mode is read off the operand template (last operand). */
+static int store_target(const dc_analysis *a, const sh4_insn *in, uint32_t *addr, unsigned *size)
+{
+    const sh4_opinfo *info = sh4_info(in->op);
+    const char *ops = info->operands, *last = ops;
+    uint32_t base, r0;
+    int depth = 0;
+
+    if (!(in->flags & F_STORE)) return 0;
+    for (const char *p = ops; *p; p++) {
+        if (*p == '(') depth++;
+        else if (*p == ')') depth--;
+        else if (*p == ',' && !depth) last = p + 1;
+    }
+    unsigned sz = strstr(info->mnemonic, ".b") ? 1 : strstr(info->mnemonic, ".w") ? 2 :
+                  (in->flags & F_FPU) ? 8 : 4;   // fmov: 4 or 8 depending on SZ, assume 8
+    if (!strcmp(last, "@%n") && resolve_reg(a, in->pc, in->n, &base)) *addr = base;
+    else if (!strcmp(last, "@-%n") && resolve_reg(a, in->pc, in->n, &base)) *addr = base - sz;
+    else if (!strcmp(last, "@(%d,%n)") && resolve_reg(a, in->pc, in->n, &base)) *addr = base + in->disp;
+    else if (!strcmp(last, "@(%d,%m)") && resolve_reg(a, in->pc, in->m, &base)) *addr = base + in->disp;
+    else if (!strcmp(last, "@(r0,%n)") && resolve_reg(a, in->pc, 0, &r0) && resolve_reg(a, in->pc, in->n, &base))
+        *addr = r0 + base;
+    else return 0;
+    *size = sz;
+    return 1;
+}
+
+/* Literal-pool words that code also stores to are variables, not constants
+ * (Shinobi's interrupt handler keeps its stack pointer and saved registers
+ * in its pool). Mark them so nothing treats them as constants. */
+static void mark_written_literals(dc_analysis *a)
+{
+    for (uint32_t pc = a->base; in_range(a, pc, 2); pc += 2) {
+        sh4_insn in;
+        uint32_t addr;
+        unsigned sz;
+        if (a->kind[index_of(a, pc)] != BYTE_CODE || !read_insn(a, pc, &in)) continue;
+        if (!store_target(a, &in, &addr, &sz)) continue;
+        for (unsigned k = 0; k < sz; k += 2) {   // count, not compare: addr can be near 0xffffffff
+            uint32_t b = (addr & ~1u) + k, w = b & ~3u;   // w: the whole literal word
+            if (in_range(a, w, 4) && a->kind[index_of(a, b)] == BYTE_DATA)
+                a->written[index_of(a, w)] = a->written[index_of(a, w + 2)] = 1;
+        }
+    }
 }
 
 /* ---- jump tables ---- */
@@ -547,7 +615,10 @@ int dc_analyze(dc_analysis *a, const dc_image *img, uint32_t base, uint32_t size
     int ok = a->kind && c.func_at;
     if (ok) {
         sh4_init();
-        ok = add_func(&c, img->entry, FUNC_FROM_ENTRY) && drain(&c);
+        ok = add_func(&c, img->entry, FUNC_FROM_ENTRY);
+        for (int i = 0; ok && i < img->nroots; i++)   // copied code (dc_image_copy)
+            ok = add_func(&c, img->roots[i], FUNC_FROM_ENTRY);
+        ok = ok && drain(&c);
     }
     /* Each pass can uncover code the others feed on (a gap function loads a
      * new callback pointer, a leaf follows a newly traced rts), so repeat
@@ -562,6 +633,12 @@ int dc_analyze(dc_analysis *a, const dc_image *img, uint32_t base, uint32_t size
 
     free(c.work.v);
     free(c.func_at);
+    if (ok) {
+        // after discovery, so every store in traced code gets looked at
+        a->written = calloc((size_t)size / 2 + 1, 1);
+        ok = a->written != NULL;
+        if (ok) mark_written_literals(a);
+    }
     if (!ok) {
         dc_analysis_free(a);
         return 0;
@@ -574,6 +651,7 @@ void dc_analysis_free(dc_analysis *a)
 {
     if (!a) return;
     free(a->kind);
+    free(a->written);
     free(a->funcs);
     memset(a, 0, sizeof *a);
 }

@@ -32,6 +32,7 @@ typedef struct {
     const dc_image *img;
     uint32_t base, size;   /* analysed range */
     uint8_t *kind;         /* BYTE_* per halfword: kind[(addr - base) / 2] */
+    uint8_t *written;      /* per halfword: a literal that code also stores to */
     dc_func *funcs;
     int nfuncs;
 } dc_analysis;
@@ -47,6 +48,10 @@ void dc_analysis_free(dc_analysis *a);
 
 /* The function starting exactly at addr, or NULL. */
 const dc_func *dc_func_at(const dc_analysis *a, uint32_t addr);
+
+/* 1 if the literal-pool word at addr is also written by the game (Shinobi
+ * keeps interrupt variables in its literal pools), so it's not a constant. */
+int dc_literal_written(const dc_analysis *a, uint32_t addr);
 
 /* The constant held in `reg` just before the instruction at pc, if it can be
  * found by walking back through straight-line code. Returns 1 if found. */
