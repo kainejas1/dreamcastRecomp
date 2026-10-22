@@ -4,9 +4,10 @@ Static recompiler for Sega Dreamcast (SH-4) games. It reads a game's
 `1ST_READ.BIN`, finds its functions and translates each one to C that runs on
 a PC against a runtime that stands in for the Dreamcast hardware.
 
-Being worked on with Sonic Adventure 2 (USA). The recompiler side works: all
-6,083 functions in SA2 are found and translated, and the output compiles. The
-runtime (memory map, BIOS, PowerVR2, AICA, controllers, GD-ROM) is next.
+Being worked on with Sonic Adventure 2 (USA). All of SA2's functions are found
+and translated, and the runtime boots it: HLE BIOS, GD-ROM reads from a .cue
+dump, video timing and interrupts. It runs its init, reads the disc's file
+system and loads the sound driver; no graphics, sound or input yet.
 
 No game data is included. You need your own disc dump, and the generated C is
 a translation of the game's code, so it stays on your machine (`out/` is
@@ -32,6 +33,27 @@ dcrecomp emit   extracted/game/1ST_READ.BIN --bin --only 0x8c1004e0   # one func
 
 `emit` writes `funcs.h`, `funcs_NNN.c` and `lookup.c`; build them with
 `-Iruntime -Iout/game` together with `runtime/sh4_helpers.c` and a runtime.
+
+`--copy DEST=SRC,LEN` is for code the game copies elsewhere at runtime (Shinobi
+copies its exception stubs into the vector area), so it gets recompiled at the
+address it runs from.
+
+### Sonic Adventure 2
+
+```
+dcrecomp emit extracted/sa2/1ST_READ.BIN --bin --out out/sa2 \
+    --copy 0x8c000000=0x8c15aba0,0x34 --copy 0x8c000100=0x8c15ab0c,0x3c \
+    --copy 0x8c000400=0x8c15ab0c,0x3c --copy 0x8c000600=0x8c15ab44,0x60
+cmake -S . -B build && cmake --build build
+build/sa2 extracted/sa2/1ST_READ.BIN extracted/sa2/IP.BIN "path/to/Sonic Adventure 2 (USA).cue"
+```
+
+Debugging switches for `sa2`:
+
+- `DC_FRAMES=n` stop after n frames, `DC_DUMP=file` write RAM out when it stops
+- `DC_HOLLYLOG=1` log hardware register accesses
+- configure with `-DDC_TRACE=ON` to record function entries (printed at exit),
+  plus `DC_TRACELOG=n` to print the first n as they happen
 
 Retail GD-ROM `1ST_READ.BIN` files are plain binaries loaded at `0x8C010000`.
 Self-boot CD-R images (CDI) usually have a scrambled `1ST_READ.BIN` that must
