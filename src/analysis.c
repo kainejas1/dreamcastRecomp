@@ -282,6 +282,14 @@ static int is_prologue(uint16_t raw)
     return 0;
 }
 
+/* fmov.s FRm,@-r15 (1111 1111 mmmm 1011) saving a callee-saved fr12..fr15.
+ * Only trusted where a pointer leads to it (SA2's 8c16626c): as a gap scan
+ * prologue it matches float data and steps back into nop padding. */
+static int is_fpu_save(uint16_t raw)
+{
+    return (raw & 0xff0f) == 0xff0b && ((raw >> 4) & 15) >= 12;
+}
+
 /* Cheap check that addr starts real code, not data that happens to decode:
  * follow the fall-through path to an unconditional rts/bra/jmp and its delay
  * slot without hitting data, undecodable words, branches out of the image or
@@ -508,16 +516,18 @@ static int scan_pointers(ctx *c)
         if (a->kind[ix] == BYTE_CODE) continue;
         if (!dc_read32(a->img, p, &value) || !in_range(a, value, 2) || (value & 1)) continue;
         // already traced inside another function (it got there with a bra),
-        // but right after an rts/jmp and pointed to from data: a function
-        // of its own too (SA2's 8c104472, in a table at 8c17eb04)
-        if (a->kind[index_of(a, value)] == BYTE_CODE && !c->func_at[index_of(a, value)] && follows_return(a, value)) {
+        // but right after an rts/jmp or padding and pointed to from data: a
+        // function of its own too (SA2's 8c104472, in a table at 8c17eb04;
+        // ADVERTISE's 8c514e80 after a literal pool and nops)
+        if (a->kind[index_of(a, value)] == BYTE_CODE && !c->func_at[index_of(a, value)] &&
+            (follows_return(a, value) || at_function_boundary(a, value))) {
             if (!add_func(c, value, FUNC_FROM_PTR)) return -1;
             added++;
             continue;
         }
         if (a->kind[index_of(a, value)] != BYTE_UNKNOWN || !dc_read16(a->img, value, &raw)) continue;
         int is_literal = a->kind[ix] == BYTE_DATA && a->kind[ix + 1] == BYTE_DATA;
-        if (!is_literal && !is_prologue(raw) && !at_function_boundary(a, value)) continue;
+        if (!is_literal && !is_prologue(raw) && !is_fpu_save(raw) && !at_function_boundary(a, value)) continue;
         if (!looks_like_code(a, value)) continue;
         int before = a->nfuncs;
         if (!add_func(c, value, FUNC_FROM_PTR)) return -1;
@@ -537,6 +547,7 @@ static uint32_t step_back(const dc_analysis *a, uint32_t pc)
         if (!in_range(a, cand, 2) || a->kind[index_of(a, cand)] != BYTE_UNKNOWN) break;
         if (!read_insn(a, cand, &in) || in.op == SH4_OP_UNKNOWN) break;
         if ((in.flags & (F_DELAY | F_BRANCH | F_CALL | F_RETURN)) || is_delay_slot(a, cand)) break;
+        if (in.raw == 0x0009) break;   // nop: alignment padding before the function, not part of it
         pc = cand;
     }
     return pc;
