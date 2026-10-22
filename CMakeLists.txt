@@ -26,6 +26,7 @@ if(DC_GAME_SRC)
     runtime/main.c
     runtime/bios.c
     runtime/gdrom.c
+    runtime/holly.c
     runtime/memory.c
     runtime/sh4_helpers.c
     ${DC_GAME_SRC}
@@ -36,4 +37,9 @@ if(DC_GAME_SRC)
   endif()
   # generated code is huge, optimise it even in debug builds
   set_source_files_properties(${DC_GAME_SRC} PROPERTIES COMPILE_OPTIONS "-O1")
+  # -DDC_TRACE=ON: record recently entered functions (slower, for debugging)
+  option(DC_TRACE "trace function entries in the recompiled game" OFF)
+  if(DC_TRACE)
+    target_compile_definitions(sa2 PRIVATE DC_TRACE)
+  endif()
 endif()

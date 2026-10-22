@@ -168,7 +168,8 @@ static void sys_misc(sh4_ctx *ctx)
     switch (ctx->r[4]) {
     case 0: trace("MISC init"); ctx->r[0] = 0; break;
     case 1:
-        fprintf(stderr, "[bios] game asked to exit to the BIOS menu\n");
+        fprintf(stderr, "[bios] game asked to exit to the BIOS menu (pr=%08x r5=%08x r6=%08x r7=%08x)\n",
+                ctx->pr, ctx->r[5], ctx->r[6], ctx->r[7]);
         exit(0);
     case 2: trace("MISC check disc"); ctx->r[0] = gd_is_open() ? 0 : (uint32_t)-1; break;
     case 3:

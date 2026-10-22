@@ -61,6 +61,15 @@ void dc_service_irq(sh4_ctx *ctx);
 /* Emitted at function entry and on every backward branch. */
 #define DC_CHECK_IRQ(ctx) do { if (dc_irq_pending) dc_service_irq(ctx); } while (0)
 
+/* Emitted at function entry. Build with -DDC_TRACE to record the most recently
+ * entered functions (the runtime prints them when the run ends). */
+#ifdef DC_TRACE
+void dc_trace_enter(uint32_t addr);
+#define DC_ENTER(ctx, addr) dc_trace_enter(addr)
+#else
+#define DC_ENTER(ctx, addr) ((void)0)
+#endif
+
 /* ---- instructions implemented as helpers ---- */
 
 uint32_t sh4_get_sr(const sh4_ctx *ctx);

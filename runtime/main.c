@@ -10,6 +10,7 @@
 
 #include "bios.h"
 #include "gdrom.h"
+#include "holly.h"
 #include "memory.h"
 #include "sh4_rt.h"
 
@@ -40,6 +41,12 @@ static void stop(const sh4_ctx *ctx, const char *fmt, ...)
     va_end(ap);
     fprintf(stderr, "\n");
     dump(ctx);
+    // DC_DUMP=file: write main RAM out for looking at with a hex editor/disasm
+    const char *path = getenv("DC_DUMP");
+    if (path) {
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(dc_ram, 1, DC_RAM_SIZE, f); fclose(f); fprintf(stderr, "  RAM dumped to %s\n", path); }
+    }
     exit(1);
 }
 
@@ -87,20 +94,74 @@ void dc_unhandled(sh4_ctx *ctx, uint32_t pc, uint16_t raw)
     stop(ctx, "reached %08x, which the recompiler couldn't translate (%04x)", pc, raw);
 }
 
-// ---- interrupts (none yet) ----
+// ---- interrupts ----
 
 // Kept at 1 so every DC_CHECK_IRQ (function entry, backward branch) lands in
-// dc_service_irq. Until there are interrupts that doubles as a watchdog for a
-// game that's stuck waiting on hardware that doesn't exist yet.
+// dc_service_irq, which looks at the video clock every so often and takes
+// pending interrupts there. That's the only place interrupts can happen, a
+// little later than on hardware, which games don't mind.
 volatile int dc_irq_pending = 1;
 
-#define WATCHDOG 300000000ull
+#define CHECK_EVERY 4096          // DC_CHECK_IRQs between looks at the clock
+#define WATCHDOG    300000000ull  // checks without a single interrupt: stuck
+
+static unsigned long long interrupts;
+static uint32_t max_frames;       // DC_FRAMES=n: stop after n frames (for test runs)
 
 void dc_service_irq(sh4_ctx *ctx)
 {
-    static unsigned long long checks;
-    if (++checks == WATCHDOG)
-        stop(ctx, "no way forward after %llu loop iterations / calls, probably waiting on hardware", checks);
+    static unsigned long long checks, since_irq;
+
+    if (++since_irq == WATCHDOG)
+        stop(ctx, "no interrupt taken for %llu checks, probably waiting on hardware", since_irq);
+    if (++checks % CHECK_EVERY) return;
+
+    if (max_frames && holly_frame_count() >= max_frames)
+        stop(ctx, "ran %u frames (DC_FRAMES), %llu interrupts taken", holly_frame_count(), interrupts);
+
+    int level = holly_pending_level();
+    uint32_t sr = sh4_get_sr(ctx);
+    if (!level || level <= (int)((sr >> 4) & 15) || (sr & SR_BL))
+        return;
+
+    // what the SH-4 does when it takes an interrupt. There's no PC to save:
+    // returning from here is "continue where we were"
+    ctx->ssr = sr;
+    ctx->sgr = ctx->r[15];
+    sh4_set_sr(ctx, sr | SR_MD | SR_RB | SR_BL);   // switches to register bank 1
+    sh4reg_write32(0xff000028u, level == 6 ? 0x320u : level == 4 ? 0x360u : 0x3a0u);   // INTEVT
+
+    interrupts++;
+    since_irq = 0;
+    dc_call(ctx, ctx->vbr + 0x600);   // the handler ends with rte
+}
+
+#ifdef DC_TRACE
+// last functions entered, oldest first when printed
+static uint32_t trace_ring[64];
+static unsigned trace_pos;
+
+void dc_trace_enter(uint32_t addr)
+{
+    static int live = -1;   // DC_TRACELOG=n: also print the first n entries as they happen
+    if (live < 0) live = getenv("DC_TRACELOG") ? atoi(getenv("DC_TRACELOG")) : 0;
+    if (live > 0) { live--; fprintf(stderr, "[fn] %08x\n", addr); }
+    trace_ring[trace_pos++ % 64] = addr;
+}
+#endif
+
+// printed however the run ends (stop, BIOS exit, entry point returning)
+static void summary(void)
+{
+    fprintf(stderr, "[run] %u frames, %llu interrupts taken\n", holly_frame_count(), interrupts);
+#ifdef DC_TRACE
+    fprintf(stderr, "[run] last functions entered:");
+    for (unsigned i = 0; i < 64; i++) {
+        unsigned k = trace_pos + i;
+        if (k >= 64 && trace_ring[k % 64]) fprintf(stderr, "%s%08x", i % 8 ? " " : "\n   ", trace_ring[k % 64]);
+    }
+    fprintf(stderr, "\n");
+#endif
 }
 
 // ---- CPU helpers that need hardware ----
@@ -120,7 +181,7 @@ void sh4_trapa(sh4_ctx *ctx, uint32_t imm, uint32_t pc)
 
 void sh4_rte(sh4_ctx *ctx)
 {
-    stop(ctx, "rte, exceptions not implemented yet");
+    sh4_set_sr(ctx, ctx->ssr);   // back to the interrupted code's SR (and bank); returning resumes it
 }
 
 void sh4_sleep(sh4_ctx *ctx)
@@ -166,6 +227,9 @@ int main(int argc, char **argv)
     cpu.vbr = 0x8c000000u;
     cpu.dbr = 0x8c000010u;
     cpu.sgr = 0x8d000000u;
+
+    if (getenv("DC_FRAMES")) max_frames = (uint32_t)strtoul(getenv("DC_FRAMES"), NULL, 0);
+    atexit(summary);
 
     fprintf(stderr, "starting at 8c010000 (%d recompiled functions)\n", dc_func_count);
     f_8c010000(&cpu);
