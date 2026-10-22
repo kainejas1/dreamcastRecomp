@@ -34,6 +34,18 @@ typedef struct {
     int nlabels;
 } func_body;
 
+// code from a --copy region: the game copies it at runtime and may patch its
+// literal pool afterwards (Shinobi's interrupt stub does, and keeps r0 in it),
+// so literals there are read at runtime instead of inlined
+static int in_copied_code(const dc_analysis *a, uint32_t pc)
+{
+    for (int i = 0; i < a->img->nregions; i++) {
+        const dc_region *r = &a->img->regions[i];
+        if (pc >= r->start && pc < r->end && !strcmp(r->name, "copy")) return 1;
+    }
+    return 0;
+}
+
 static void free_body(func_body *b)
 {
     free(b->insns);
@@ -270,6 +282,13 @@ static int collect_body(const dc_analysis *a, const dc_func *f,
     }
 
     qsort(body->insns, body->ninsns, sizeof *body->insns, cmp_u32);
+
+    // code below the entry point (reached by a backward branch) sorts first,
+    // but the function still has to start at f->start: emit_function jumps there
+    if (body->ninsns && body->insns[0] != f->start &&
+        !add_unique(body->labels, &body->nlabels, MAX_LABELS, f->start))
+        goto fail;
+
     qsort(body->labels, body->nlabels, sizeof *body->labels, cmp_u32);
 
     free(seen);
@@ -356,7 +375,7 @@ static void emit_control(FILE *out, const dc_analysis *a, const dc_func *f,
         break;
 
     case SH4_OP_JSR:
-        if (dc_resolve_reg(a, in->pc, in->n, &target) && dc_func_at(a, target)) {
+        if (!in_copied_code(a, in->pc) && dc_resolve_reg(a, in->pc, in->n, &target) && dc_func_at(a, target)) {
             emit_slot(out, a, in);
             fprintf(out,
                     "    ctx->pr = 0x%08xu; f_%08x(ctx);\n",
@@ -371,7 +390,7 @@ static void emit_control(FILE *out, const dc_analysis *a, const dc_func *f,
 
     case SH4_OP_BSRF:
         // target is pc + 4 + Rn, not Rn
-        if (dc_resolve_reg(a, in->pc, in->n, &target) && dc_func_at(a, in->pc + 4 + target)) {
+        if (!in_copied_code(a, in->pc) && dc_resolve_reg(a, in->pc, in->n, &target) && dc_func_at(a, in->pc + 4 + target)) {
             emit_slot(out, a, in);
             fprintf(out,
                     "    ctx->pr = 0x%08xu; f_%08x(ctx);\n",
@@ -390,7 +409,7 @@ static void emit_control(FILE *out, const dc_analysis *a, const dc_func *f,
         int n = dc_jump_table(a, f->start, in->pc,
                               targets, DC_MAX_TABLE, &dispatch);
 
-        int fixed = n == 0 && dc_resolve_reg(a, in->pc, in->n, &target);
+        int fixed = n == 0 && !in_copied_code(a, in->pc) && dc_resolve_reg(a, in->pc, in->n, &target);
 
         // where it goes, worked out before the slot runs (braf is pc+4 relative)
         if (fixed)
@@ -529,6 +548,10 @@ static void emit_insn(FILE *out, const dc_analysis *a, const sh4_insn *in)
             break;
         case SH4_OP_MOVL_PC: {                   /* mov.l @(disp,PC),Rn: inline the literal */
             uint32_t v = 0;
+            if (in_copied_code(a, in->pc) || dc_literal_written(a, in->target)) {   // a variable, not a constant
+                fprintf(out, "    ctx->r[%u] = mem_r32(0x%08xu);\n", in->n, in->target);
+                break;
+            }
             dc_read32(a->img, in->target, &v);
             fprintf(out, "    ctx->r[%u] = 0x%08xu;\n", in->n, v);
             break;
@@ -693,6 +716,10 @@ static void emit_insn(FILE *out, const dc_analysis *a, const sh4_insn *in)
 
         case SH4_OP_MOVW_PC: {  // 16-bit literal, sign extended at emit time
             uint16_t v = 0;
+            if (in_copied_code(a, in->pc) || dc_literal_written(a, in->target)) {
+                fprintf(out, "    ctx->r[%u] = (uint32_t)(int32_t)(int16_t)mem_r16(0x%08xu);\n", in->n, in->target);
+                break;
+            }
             dc_read16(a->img, in->target, &v);
             fprintf(out, "    ctx->r[%u] = 0x%08xu;\n", in->n, (uint32_t)(int32_t)(int16_t)v);
             break;
@@ -1098,6 +1125,9 @@ static int emit_function(FILE *out, const dc_analysis *a, const dc_func *f)
 
     fprintf(out, "void f_%08x(sh4_ctx *ctx)\n{\n", f->start);
     fprintf(out, "    DC_CHECK_IRQ(ctx);\n");
+    fprintf(out, "    DC_ENTER(ctx, 0x%08xu);\n", f->start);
+    if (body.ninsns && body.insns[0] != f->start)   // body starts below the entry point
+        fprintf(out, "    goto L_%08x;\n", f->start);
 
     for (int i = 0; i < body.ninsns; i++) {
         sh4_insn in;
