@@ -65,11 +65,85 @@ static int read_screen(int *w, int *h)
     return 1;
 }
 
+// ---- input ----
+
+static SDL_Gamepad *gamepad;
+
+#define MAX_PRESSES 32
+static struct { uint32_t frame; unsigned short button; } presses[MAX_PRESSES];
+static int npresses;
+
+static void parse_presses(void)
+{
+    static const struct { const char *name; unsigned short bit; } names[] = {
+        { "a", PAD_A }, { "b", PAD_B }, { "x", PAD_X }, { "y", PAD_Y }, { "start", PAD_START },
+        { "up", PAD_UP }, { "down", PAD_DOWN }, { "left", PAD_LEFT }, { "right", PAD_RIGHT },
+    };
+    const char *s = getenv("DC_PRESS");
+    while (s && *s && npresses < MAX_PRESSES) {
+        char *end;
+        uint32_t frame = (uint32_t)strtoul(s, &end, 0);
+        if (*end != ':') break;
+        s = end + 1;
+        size_t len = strcspn(s, ",");
+        for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+            if (strlen(names[i].name) == len && !strncmp(s, names[i].name, len)) {
+                presses[npresses].frame = frame;
+                presses[npresses++].button = names[i].bit;
+            }
+        s += len;
+        if (*s == ',') s++;
+    }
+}
+
+void video_pad(dc_pad *pad)
+{
+    memset(pad, 0, sizeof *pad);
+    pad->x = pad->y = 0x80;
+
+    uint32_t frame = holly_frame_count();
+    for (int i = 0; i < npresses; i++)   // held for 8 frames
+        if (frame >= presses[i].frame && frame < presses[i].frame + 8) pad->buttons |= presses[i].button;
+
+    if (!renderer) return;
+    const bool *k = SDL_GetKeyboardState(NULL);
+    if (k[SDL_SCANCODE_UP]) pad->buttons |= PAD_UP;
+    if (k[SDL_SCANCODE_DOWN]) pad->buttons |= PAD_DOWN;
+    if (k[SDL_SCANCODE_LEFT]) pad->buttons |= PAD_LEFT;
+    if (k[SDL_SCANCODE_RIGHT]) pad->buttons |= PAD_RIGHT;
+    if (k[SDL_SCANCODE_Z]) pad->buttons |= PAD_A;
+    if (k[SDL_SCANCODE_X]) pad->buttons |= PAD_B;
+    if (k[SDL_SCANCODE_A]) pad->buttons |= PAD_X;
+    if (k[SDL_SCANCODE_S]) pad->buttons |= PAD_Y;
+    if (k[SDL_SCANCODE_RETURN]) pad->buttons |= PAD_START;
+    if (k[SDL_SCANCODE_Q]) pad->lt = 255;
+    if (k[SDL_SCANCODE_W]) pad->rt = 255;
+
+    if (gamepad) {
+        static const struct { SDL_GamepadButton b; unsigned short bit; } map[] = {
+            { SDL_GAMEPAD_BUTTON_SOUTH, PAD_A }, { SDL_GAMEPAD_BUTTON_EAST, PAD_B },
+            { SDL_GAMEPAD_BUTTON_WEST, PAD_X }, { SDL_GAMEPAD_BUTTON_NORTH, PAD_Y },
+            { SDL_GAMEPAD_BUTTON_START, PAD_START }, { SDL_GAMEPAD_BUTTON_DPAD_UP, PAD_UP },
+            { SDL_GAMEPAD_BUTTON_DPAD_DOWN, PAD_DOWN }, { SDL_GAMEPAD_BUTTON_DPAD_LEFT, PAD_LEFT },
+            { SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_RIGHT },
+        };
+        for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
+            if (SDL_GetGamepadButton(gamepad, map[i].b)) pad->buttons |= map[i].bit;
+        int x = SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTX), y = SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY);
+        int l = SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER), r = SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+        pad->x = (unsigned char)((x + 32768) >> 8);
+        pad->y = (unsigned char)((y + 32768) >> 8);
+        if (l > 0) pad->lt = (unsigned char)(l >> 7);
+        if (r > 0) pad->rt = (unsigned char)(r >> 7);
+    }
+}
+
 void video_init(void)
 {
+    parse_presses();
     if (getenv("DC_NOWINDOW")) return;
     SDL_SetMainReady();
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[video] SDL_Init failed: %s, running without a window\n", SDL_GetError());
         return;
     }
@@ -88,8 +162,14 @@ void video_frame(void)
     if (!renderer) return;
 
     SDL_Event e;
-    while (SDL_PollEvent(&e))
+    while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) exit(0);
+        if (e.type == SDL_EVENT_GAMEPAD_ADDED && !gamepad) gamepad = SDL_OpenGamepad(e.gdevice.which);
+        if (e.type == SDL_EVENT_GAMEPAD_REMOVED && gamepad && SDL_GetGamepadID(gamepad) == e.gdevice.which) {
+            SDL_CloseGamepad(gamepad);
+            gamepad = NULL;
+        }
+    }
 
     int w, h;
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);

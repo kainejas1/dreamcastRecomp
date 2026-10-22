@@ -12,6 +12,7 @@
 #include "bios.h"
 #include "gdrom.h"
 #include "holly.h"
+#include "maple.h"
 #include "memory.h"
 #include "sh4_rt.h"
 #include "video.h"
@@ -250,6 +251,7 @@ int main(int argc, char **argv)
         return 2;
     }
     mem_init();
+    maple_init();
     bios_init();   // before loading: it fills low RAM, IP.BIN goes on top
     if (argc > 3 && !gd_open(argv[3], err, sizeof err)) {
         fprintf(stderr, "error: %s\n", err);

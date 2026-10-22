@@ -29,6 +29,7 @@ if(DC_GAME_SRC)
     runtime/coro.c
     runtime/gdrom.c
     runtime/holly.c
+    runtime/maple.c
     runtime/memory.c
     runtime/pvr.c
     runtime/sh4_helpers.c

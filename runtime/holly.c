@@ -1,4 +1,5 @@
 #include "holly.h"
+#include "maple.h"
 #include "memory.h"
 #include "pvr.h"
 
@@ -147,6 +148,10 @@ static void update_video_events(void)
 
             if (crossed == vblank_in) {
                 frame_count++;
+                // Maple DMA started by vblank (SB_MDTSEL bit 0)
+                if ((holly_regs[(MAPLE_SB_MDTSEL - HOLLY_REG_BASE) / 4u] & 1) &&
+                    (holly_regs[(MAPLE_SB_MDEN - HOLLY_REG_BASE) / 4u] & 1))
+                    maple_dma();
                 pending_status |= STATUS_NORMAL_VBLANK_IN;
 
                 holly_regs[
@@ -270,6 +275,10 @@ void holly_write32(uint32_t address, uint32_t value)
         if (holly_regs[(G2_DMA_BASE + ch * 0x20u + 0x14u - HOLLY_REG_BASE) / 4u] & 1)
             g2_dma(ch);
     }
+
+    // Maple DMA started by software (SA2 does it this way)
+    if (address == MAPLE_SB_MDST && (value & 1) && (holly_regs[(MAPLE_SB_MDEN - HOLLY_REG_BASE) / 4u] & 1))
+        maple_dma();
 
     // PowerVR registers (TA list init, start render, ...) and the ch2 DMA
     // that feeds the TA
