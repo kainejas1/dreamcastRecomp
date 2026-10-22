@@ -16,7 +16,8 @@ stays on your machine (`extracted/` and `out/` are ignored by git).
 - `tools/gdrom_extract.py` - get IP.BIN and 1ST_READ.BIN off a .cue/.gdi
 - `tools/prs_modules.py` - unpack the code modules a game loads at runtime
 - `runtime/` - memory map, HLE BIOS, GD-ROM, video timing, interrupts, sound
-  RAM and AICA registers, G2 DMA, store queues, game threads on host fibers
+  RAM and AICA registers, G2 DMA, store queues, game threads on host fibers,
+  PowerVR (TA + software renderer), SDL3 window
 
 ## Progress
 
@@ -25,7 +26,9 @@ stays on your machine (`extracted/` and `out/` are ignored by git).
 - runtime boots SA2: BIOS calls, disc reads, interrupts
 - sound driver handshake faked, game's thread scheduler runs
 - code modules (screens, stages) recompiled too; MCWARN runs
-- next: PowerVR, first frame
+- PowerVR: TA display lists, software renderer, SDL3 window
+- first frame: the memory card warning screen
+- next: controllers and VMU (Maple), title screen
 
 ## Build
 
@@ -48,6 +51,6 @@ cmake -S . -B build && cmake --build build
 build/sa2 extracted/sa2/1ST_READ.BIN extracted/sa2/IP.BIN "path/to/sa2.cue"
 ```
 
-Debug switches: `DC_FRAMES=n`, `DC_DUMP=file`, `DC_HOLLYLOG=1`, `DC_IRQLOG=n`,
-`DC_BIOSLOG=n`, `DC_AICALOG=1`, `DC_COROLOG=n`, and `-DDC_TRACE=ON` with
-`DC_TRACELOG=n`.
+Debug switches: `DC_FRAMES=n`, `DC_DUMP=file`, `DC_SHOT=file.png`, `DC_NOWINDOW=1`,
+`DC_HOLLYLOG=1`, `DC_IRQLOG=n`, `DC_BIOSLOG=n`, `DC_AICALOG=1`, `DC_COROLOG=n`,
+`DC_PVRLOG=n`, and `-DDC_TRACE=ON` with `DC_TRACELOG=n`.
