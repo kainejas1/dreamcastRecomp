@@ -64,8 +64,8 @@ void dc_service_irq(sh4_ctx *ctx);
 /* Emitted at function entry. Build with -DDC_TRACE to record the most recently
  * entered functions (the runtime prints them when the run ends). */
 #ifdef DC_TRACE
-void dc_trace_enter(uint32_t addr);
-#define DC_ENTER(ctx, addr) dc_trace_enter(addr)
+void dc_trace_enter(uint32_t addr, uint32_t sp);
+#define DC_ENTER(ctx, addr) dc_trace_enter(addr, (ctx)->r[15])
 #else
 #define DC_ENTER(ctx, addr) ((void)0)
 #endif

@@ -135,19 +135,28 @@ void dc_service_irq(sh4_ctx *ctx)
 
     interrupts++;
     since_irq = 0;
+    static int irqlog = -1;   // DC_IRQLOG=n: print the first n interrupts taken
+    if (irqlog < 0) irqlog = getenv("DC_IRQLOG") ? atoi(getenv("DC_IRQLOG")) : 0;
+    if (irqlog > 0) {
+        irqlog--;
+        fprintf(stderr, "[irq] level %d, frame %u, ISTNRM %08x ISTEXT %08x\n", level, holly_frame_count(),
+                holly_read32(HOLLY_SB_ISTNRM), holly_read32(HOLLY_SB_ISTEXT));
+    }
     dc_call(ctx, ctx->vbr + 0x600);   // the handler ends with rte
 }
 
 #ifdef DC_TRACE
 // last functions entered, oldest first when printed
-static uint32_t trace_ring[64];
+// with the stack pointer at entry, for finding stack mixups
+static uint32_t trace_ring[64], trace_sp[64];
 static unsigned trace_pos;
 
-void dc_trace_enter(uint32_t addr)
+void dc_trace_enter(uint32_t addr, uint32_t sp)
 {
     static int live = -1;   // DC_TRACELOG=n: also print the first n entries as they happen
     if (live < 0) live = getenv("DC_TRACELOG") ? atoi(getenv("DC_TRACELOG")) : 0;
-    if (live > 0) { live--; fprintf(stderr, "[fn] %08x\n", addr); }
+    if (live > 0) { live--; fprintf(stderr, "[fn] %08x  sp %08x\n", addr, sp); }
+    trace_sp[trace_pos % 64] = sp;
     trace_ring[trace_pos++ % 64] = addr;
 }
 #endif
@@ -157,10 +166,11 @@ static void summary(void)
 {
     fprintf(stderr, "[run] %u frames, %llu interrupts taken\n", holly_frame_count(), interrupts);
 #ifdef DC_TRACE
-    fprintf(stderr, "[run] last functions entered:");
+    fprintf(stderr, "[run] last functions entered (function/sp):");
     for (unsigned i = 0; i < 64; i++) {
         unsigned k = trace_pos + i;
-        if (k >= 64 && trace_ring[k % 64]) fprintf(stderr, "%s%08x", i % 8 ? " " : "\n   ", trace_ring[k % 64]);
+        if (k >= 64 && trace_ring[k % 64])
+            fprintf(stderr, "%s%08x/%08x", i % 4 ? "  " : "\n   ", trace_ring[k % 64], trace_sp[k % 64]);
     }
     fprintf(stderr, "\n");
 #endif

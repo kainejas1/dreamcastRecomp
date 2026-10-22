@@ -30,10 +30,11 @@
 
 #define SYSINFO_BLOCK 0x8c000068u   // 24 bytes: console id, region/language/tv
 
-static int verbose_calls = 40;   // log the first N syscalls
+static int verbose_calls = -1;   // log the first N syscalls (DC_BIOSLOG=n, default 40)
 
 static void trace(const char *fmt, ...)
 {
+    if (verbose_calls < 0) verbose_calls = getenv("DC_BIOSLOG") ? atoi(getenv("DC_BIOSLOG")) : 40;
     if (verbose_calls <= 0) return;
     verbose_calls--;
     va_list ap;
