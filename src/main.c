@@ -26,7 +26,11 @@ static void usage(void)
         "  --out DIR        emit: output directory (default out)\n"
         "  --only ADDR      emit: just the function at ADDR, to stdout\n"
         "  --copy D=S,LEN   code the game copies to D from S at runtime; recompile it at D\n"
-        "                   (repeatable)\n",
+        "                   (repeatable)\n"
+        "  --setjmp ADDR    emit: the game's setjmp and longjmp, if it switches threads\n"
+        "  --longjmp ADDR   with them (the runtime gives each thread a host fiber)\n"
+        "  --modules LIST   emit: also code the game loads at runtime. LIST has a line\n"
+        "                   per module: NAME FILE BASE ENTRY... (tools/prs_modules.py)\n",
         DC_DEFAULT_BASE);
 }
 
@@ -38,6 +42,8 @@ typedef struct {
     uint32_t base, start, end;
     const char *out_dir;   /* emit */
     uint32_t only;         /* emit */
+    uint32_t setjmp_fn, longjmp_fn;   /* emit */
+    const char *modules;              /* emit */
     struct { uint32_t dest, src, len; } copies[MAX_COPIES];
     int ncopies;
 } options;
@@ -55,6 +61,9 @@ static int parse_options(int argc, char **argv, options *o)
         else if (!strcmp(a, "--end") && i + 1 < argc) o->end = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(a, "--out") && i + 1 < argc) o->out_dir = argv[++i];
         else if (!strcmp(a, "--only") && i + 1 < argc) o->only = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--setjmp") && i + 1 < argc) o->setjmp_fn = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--longjmp") && i + 1 < argc) o->longjmp_fn = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--modules") && i + 1 < argc) o->modules = argv[++i];
         else if (!strcmp(a, "--copy") && i + 1 < argc && o->ncopies < MAX_COPIES) {
             // DEST=SRC,LEN, e.g. 0x8c000600=0x8c15ab44,0x60
             char *p = argv[++i], *end;
@@ -222,14 +231,80 @@ static int cmd_funcs(const options *o)
     return 0;
 }
 
+// --modules LIST: each line NAME FILE BASE ENTRY..., FILE relative to LIST.
+// Every module is loaded and analysed on its own, then modules.c lists them
+static int emit_modules(const options *o, const dc_analysis *main_a, const dc_emit_options *eo)
+{
+    dc_module_info *mods = NULL;
+    int n = 0, ok = 1;
+
+    FILE *f = o->modules ? fopen(o->modules, "r") : NULL;
+    if (o->modules && !f) { fprintf(stderr, "error: can't read %s\n", o->modules); return 0; }
+
+    char dir[1024] = ".";
+    if (o->modules) {
+        snprintf(dir, sizeof dir, "%s", o->modules);
+        char *slash = strrchr(dir, '/'), *back = strrchr(dir, '\\');
+        if (back > slash) slash = back;
+        if (slash) *slash = '\0'; else strcpy(dir, ".");
+    }
+
+    char line[1024];
+    while (ok && f && fgets(line, sizeof line, f)) {
+        char *name = strtok(line, " \t\r\n");
+        if (!name || name[0] == '#') continue;
+        char *file = strtok(NULL, " \t\r\n"), *base_s = strtok(NULL, " \t\r\n");
+        if (!file || !base_s) { fprintf(stderr, "error: bad line in %s: %s\n", o->modules, name); ok = 0; break; }
+
+        char path[2048], err[256];
+        snprintf(path, sizeof path, "%s/%s", dir, file);
+        uint32_t base = (uint32_t)strtoul(base_s, NULL, 0);
+        dc_image img;
+        dc_analysis a;
+        if (!dc_load_bin(&img, path, base, err, sizeof err)) { fprintf(stderr, "error: %s\n", err); ok = 0; break; }
+
+        // the entry points; the first bytes are the module's header, not code
+        int nentries = 0;
+        for (char *e; (e = strtok(NULL, " \t\r\n")); nentries++) {
+            uint32_t addr = (uint32_t)strtoul(e, NULL, 0);
+            if (!nentries) img.entry = addr;
+            else dc_image_add_root(&img, addr);
+        }
+        if (!nentries) fprintf(stderr, "emit: warning: module %s has no entry points\n", name);
+
+        // some modules have an odd size, analysis wants whole halfwords
+        if (!dc_analyze(&a, &img, img.regions[0].start, (img.regions[0].end - img.regions[0].start + 1) & ~1u)) {
+            fprintf(stderr, "error: analysis of module %s failed\n", name);
+            dc_image_free(&img);
+            ok = 0;
+            break;
+        }
+        dc_module_info *p = realloc(mods, (size_t)(n + 1) * sizeof *mods);
+        if (!p) ok = 0;
+        else {
+            mods = p;
+            ok = dc_emit_module(&a, main_a, eo, name, &mods[n]);
+            n += ok;
+        }
+        dc_analysis_free(&a);
+        dc_image_free(&img);
+    }
+    if (f) fclose(f);
+
+    ok = ok && dc_emit_registry(eo, mods, n);
+    free(mods);
+    return ok;
+}
+
 static int cmd_emit(const options *o)
 {
     dc_image img;
     dc_analysis a;
     if (!load_and_analyze(o, &img, &a)) return 1;
 
-    dc_emit_options eo = { o->out_dir ? o->out_dir : "out", o->only, 200 };
+    dc_emit_options eo = { o->out_dir ? o->out_dir : "out", o->only, 200, o->setjmp_fn, o->longjmp_fn };
     int ok = dc_emit(&a, &eo);
+    if (ok && !o->only) ok = emit_modules(o, &a, &eo);
 
     dc_analysis_free(&a);
     dc_image_free(&img);

@@ -24,6 +24,21 @@ typedef struct {
 extern const dc_func_entry dc_func_table[];
 extern const int dc_func_count;
 
+/* Code the game loads at runtime (dcrecomp emit --modules), from modules.c.
+ * Several can share an address; dc_lookup uses the one that's in memory:
+ * magic matches the first 8 bytes at base and sig_hash the code at sig_addr. */
+typedef struct {
+    const char *name;
+    uint32_t base, size;
+    unsigned char magic[8];
+    uint32_t sig_addr, sig_len, sig_hash;   /* FNV-1a */
+    const dc_func_entry *funcs;
+    int nfuncs;
+} dc_module;
+
+extern const dc_module dc_modules[];
+extern const int dc_module_count;
+
 /* ---- memory (virtual addresses; the runtime handles mirrors and MMIO) ---- */
 
 uint8_t  mem_r8(uint32_t addr);

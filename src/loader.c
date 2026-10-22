@@ -230,6 +230,15 @@ int dc_image_copy(dc_image *img, uint32_t dest, uint32_t src, uint32_t len, char
     return 1;
 }
 
+int dc_image_add_root(dc_image *img, uint32_t addr)
+{
+    uint32_t *p = realloc(img->roots, (size_t)(img->nroots + 1) * sizeof *img->roots);
+    if (!p) return 0;
+    img->roots = p;
+    img->roots[img->nroots++] = addr;
+    return 1;
+}
+
 void dc_image_free(dc_image *img)
 {
     for (int i = 0; i < img->nsyms; i++) free(img->syms[i].name);

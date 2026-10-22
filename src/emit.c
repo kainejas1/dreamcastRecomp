@@ -1,5 +1,6 @@
 #include "emit.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -304,6 +305,47 @@ fail:
 
 static void emit_insn(FILE *out, const dc_analysis *a, const sh4_insn *in);
 
+// --setjmp / --longjmp. Games switch threads with them, which plain C calls
+// can't follow; the runtime does it with a fiber per thread (runtime/coro.c)
+static uint32_t setjmp_fn, longjmp_fn;
+
+// whose functions these are: "f" for the main program, "m_stg09" for a
+// module (--modules). A module's calls into the main program (main_a) are
+// direct calls too
+static const char *prefix = "f";
+static const dc_analysis *main_a;
+// main program functions a module calls, declared in the module's own header
+// so modules don't include funcs.h (and don't all rebuild when it changes)
+static uint32_t *ext_calls;
+static int next_calls, ext_cap;
+
+// name prefix for calling target directly, NULL if it's not a function we know
+static const char *callee(const dc_analysis *a, uint32_t target)
+{
+    if (dc_func_at(a, target)) return prefix;
+    if (main_a && main_a != a && dc_func_at(main_a, target)) {
+        if (next_calls == ext_cap) {
+            ext_cap = ext_cap ? ext_cap * 2 : 256;
+            ext_calls = realloc(ext_calls, (size_t)ext_cap * sizeof *ext_calls);
+            if (!ext_calls) { fprintf(stderr, "emit: out of memory\n"); exit(1); }
+        }
+        ext_calls[next_calls++] = target;
+        return "f";
+    }
+    return NULL;
+}
+
+// a direct call to a known function
+static void emit_call(FILE *out, uint32_t ret, const char *name, uint32_t target)
+{
+    if (setjmp_fn && target == setjmp_fn)
+        fprintf(out, "    ctx->pr = 0x%08xu; DC_SETJMP(ctx, %s_%08x);\n", ret, name, target);
+    else if (longjmp_fn && target == longjmp_fn)
+        fprintf(out, "    ctx->pr = 0x%08xu; DC_LONGJMP(ctx, %s_%08x);\n", ret, name, target);
+    else
+        fprintf(out, "    ctx->pr = 0x%08xu; %s_%08x(ctx);\n", ret, name, target);
+}
+
 static void emit_slot(FILE *out, const dc_analysis *a, const sh4_insn *branch)
 {
     uint16_t raw;
@@ -319,13 +361,20 @@ static void emit_slot(FILE *out, const dc_analysis *a, const sh4_insn *branch)
 static void emit_goto(FILE *out, const dc_analysis *a, const func_body *body,
                       uint32_t from, uint32_t target)
 {
+    const char *name;
     if (bsearch(&target, body->insns, body->ninsns, sizeof *body->insns, cmp_u32)) {
         if (target <= from) // backward: give interrupts a chance
             fprintf(out, "{ DC_CHECK_IRQ(ctx); goto L_%08x; }\n", target);
         else
             fprintf(out, "goto L_%08x;\n", target);
-    } else if (dc_func_at(a, target)) {
-        fprintf(out, "{ f_%08x(ctx); return; }\n", target);
+    } else if ((name = callee(a, target))) {
+        if (longjmp_fn && target == longjmp_fn)
+            fprintf(out, "{ DC_LONGJMP(ctx, %s_%08x); return; }\n", name, target);
+        else
+            fprintf(out, "{ %s_%08x(ctx); return; }\n", name, target);
+        // setjmp would come back to our caller's caller, no host frame for that
+        if (setjmp_fn && target == setjmp_fn)
+            fprintf(stderr, "emit: tail jump to setjmp at %08x, not supported\n", from);
     } else {
         fprintf(out, "{ dc_jump(ctx, 0x%08xu); return; }\n", target);
     }
@@ -336,14 +385,13 @@ static void emit_control(FILE *out, const dc_analysis *a, const dc_func *f,
                          const func_body *body, const sh4_insn *in)
 {
     uint32_t target;
+    const char *name;
 
     switch (in->op) {
     case SH4_OP_BSR:
         emit_slot(out, a, in);
-        if (dc_func_at(a, in->target))
-            fprintf(out,
-                    "    ctx->pr = 0x%08xu; f_%08x(ctx);\n",
-                    in->pc + 4, in->target);
+        if ((name = callee(a, in->target)))
+            emit_call(out, in->pc + 4, name, in->target);
         else
             fprintf(out, "    ctx->pr = 0x%08xu; dc_call(ctx, 0x%08xu);\n", in->pc + 4, in->target);
         break;
@@ -375,11 +423,9 @@ static void emit_control(FILE *out, const dc_analysis *a, const dc_func *f,
         break;
 
     case SH4_OP_JSR:
-        if (!in_copied_code(a, in->pc) && dc_resolve_reg(a, in->pc, in->n, &target) && dc_func_at(a, target)) {
+        if (!in_copied_code(a, in->pc) && dc_resolve_reg(a, in->pc, in->n, &target) && (name = callee(a, target))) {
             emit_slot(out, a, in);
-            fprintf(out,
-                    "    ctx->pr = 0x%08xu; f_%08x(ctx);\n",
-                    in->pc + 4, target);
+            emit_call(out, in->pc + 4, name, target);
         } else {
             // computed call (callbacks etc): grab Rn before the slot
             fprintf(out, "    {\n    uint32_t t = ctx->r[%u];\n", in->n);
@@ -390,11 +436,9 @@ static void emit_control(FILE *out, const dc_analysis *a, const dc_func *f,
 
     case SH4_OP_BSRF:
         // target is pc + 4 + Rn, not Rn
-        if (!in_copied_code(a, in->pc) && dc_resolve_reg(a, in->pc, in->n, &target) && dc_func_at(a, in->pc + 4 + target)) {
+        if (!in_copied_code(a, in->pc) && dc_resolve_reg(a, in->pc, in->n, &target) && (name = callee(a, in->pc + 4 + target))) {
             emit_slot(out, a, in);
-            fprintf(out,
-                    "    ctx->pr = 0x%08xu; f_%08x(ctx);\n",
-                    in->pc + 4, in->pc + 4 + target);
+            emit_call(out, in->pc + 4, name, in->pc + 4 + target);
         } else {
             fprintf(out, "    {\n    uint32_t t = 0x%08xu + ctx->r[%u];\n", in->pc + 4, in->n);
             emit_slot(out, a, in);
@@ -1123,7 +1167,7 @@ static int emit_function(FILE *out, const dc_analysis *a, const dc_func *f)
     func_body body;
     if (!collect_body(a, f, &body)) return 0;
 
-    fprintf(out, "void f_%08x(sh4_ctx *ctx)\n{\n", f->start);
+    fprintf(out, "void %s_%08x(sh4_ctx *ctx)\n{\n", prefix, f->start);
     fprintf(out, "    DC_CHECK_IRQ(ctx);\n");
     fprintf(out, "    DC_ENTER(ctx, 0x%08xu);\n", f->start);
     if (body.ninsns && body.insns[0] != f->start)   // body starts below the entry point
@@ -1193,13 +1237,116 @@ static void make_dirs(const char *path)
     }
 }
 
+// files are written as NAME.tmp and only replace NAME if they changed, so a
+// re-emit doesn't make the build recompile everything
 static FILE *open_out(const char *dir, const char *name)
 {
     char path[1100];
-    snprintf(path, sizeof path, "%s/%s", dir, name);
+    snprintf(path, sizeof path, "%s/%s.tmp", dir, name);
     FILE *f = fopen(path, "w");
     if (!f) fprintf(stderr, "emit: can't write %s\n", path);
     return f;
+}
+
+static int same_file(const char *a, const char *b)
+{
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    int same = fa && fb;
+    while (same) {
+        int ca = getc(fa), cb = getc(fb);
+        if (ca != cb) same = 0;
+        if (ca == EOF) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+
+static int close_out(FILE *f, const char *dir, const char *name)
+{
+    char path[1100], tmp[1100];
+    int ok = !ferror(f);
+    fclose(f);
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    snprintf(tmp, sizeof tmp, "%s/%s.tmp", dir, name);
+    if (ok && same_file(tmp, path)) { remove(tmp); return 1; }
+    remove(path);   // rename won't replace a file on Windows
+    if (!ok || rename(tmp, path)) { fprintf(stderr, "emit: can't write %s\n", path); return 0; }
+    return 1;
+}
+
+// "STG09" -> "stg09", for C names and file names
+static void c_name(char *dst, size_t size, const char *name)
+{
+    size_t n = 0;
+    for (const char *p = name; *p && n + 1 < size; p++)
+        dst[n++] = isalnum((unsigned char)*p) ? (char)tolower((unsigned char)*p) : '_';
+    dst[n] = '\0';
+}
+
+/* One set of functions, the main program's or a module's, into dir:
+ *   HEADER        prototypes
+ *   STEM_NNN.c    the functions, `per` to a file, starting with `includes`
+ *   LOOKUP        address -> function table (sorted) for the runtime, named
+ *                 TABLE; COUNT (if not NULL) holds its size */
+static int emit_set(const dc_analysis *a, const char *dir, const char *header, const char *stem,
+                    const char *includes, const char *lookup, const char *table, const char *count,
+                    int per, int *nfiles_out)
+{
+    char guard[64], name[96];
+    size_t g = 0;
+    for (const char *p = header; *p && g + 1 < sizeof guard; p++)
+        guard[g++] = *p == '.' ? '_' : (char)toupper((unsigned char)*p);
+    guard[g] = '\0';
+
+    int nfiles = 0;
+    next_calls = 0;
+    FILE *out = NULL;
+    for (int i = 0; i < a->nfuncs; i++) {
+        if (i % per == 0) {
+            if (out && !close_out(out, dir, name)) return 0;
+            snprintf(name, sizeof name, "%s_%03d.c", stem, nfiles++);
+            out = open_out(dir, name);
+            if (!out) return 0;
+            fprintf(out, "/* generated by dcrecomp, don't edit */\n%s\n", includes);
+        }
+        if (!emit_function(out, a, &a->funcs[i])) {
+            fprintf(stderr, "emit: %s_%08x: collect_body() failed\n", prefix, a->funcs[i].start);
+            fclose(out);
+            return 0;
+        }
+    }
+    if (out && !close_out(out, dir, name)) return 0;
+
+    // after the functions, which collect what a module calls in the main program
+    FILE *h = open_out(dir, header);
+    if (!h) return 0;
+    fprintf(h, "/* generated by dcrecomp, don't edit */\n#ifndef %s\n#define %s\n\n#include \"sh4_rt.h\"\n\n", guard, guard);
+    for (int i = 0; i < a->nfuncs; i++)
+        fprintf(h, "void %s_%08x(sh4_ctx *ctx);\n", prefix, a->funcs[i].start);
+    if (next_calls) {
+        qsort(ext_calls, (size_t)next_calls, sizeof *ext_calls, cmp_u32);
+        fprintf(h, "\n/* in the main program */\n");
+        for (int i = 0; i < next_calls; i++)
+            if (!i || ext_calls[i] != ext_calls[i - 1])
+                fprintf(h, "void f_%08x(sh4_ctx *ctx);\n", ext_calls[i]);
+    }
+    fprintf(h, "\n#endif\n");
+    if (!close_out(h, dir, header)) return 0;
+
+    // a->funcs is sorted by address already, so the runtime can binary search
+    FILE *l = open_out(dir, lookup);
+    if (!l) return 0;
+    fprintf(l, "/* generated by dcrecomp, don't edit */\n#include \"%s\"\n\n", header);
+    fprintf(l, "const dc_func_entry %s[] = {\n", table);
+    for (int i = 0; i < a->nfuncs; i++)
+        fprintf(l, "    { 0x%08xu, %s_%08x },\n", a->funcs[i].start, prefix, a->funcs[i].start);
+    fprintf(l, "};\n");
+    if (count) fprintf(l, "\nconst int %s = %d;\n", count, a->nfuncs);
+    if (!close_out(l, dir, lookup)) return 0;
+
+    *nfiles_out = nfiles;
+    return 1;
 }
 
 /* Writes into opt->out_dir:
@@ -1209,6 +1356,13 @@ static FILE *open_out(const char *dir, const char *name)
  * With opt->only set, just that one function goes to stdout instead. */
 int dc_emit(const dc_analysis *a, const dc_emit_options *opt)
 {
+    setjmp_fn = opt->setjmp_fn;
+    longjmp_fn = opt->longjmp_fn;
+    prefix = "f";
+    main_a = NULL;
+    if (setjmp_fn && !dc_func_at(a, setjmp_fn)) fprintf(stderr, "emit: warning: no function at --setjmp %08x\n", setjmp_fn);
+    if (longjmp_fn && !dc_func_at(a, longjmp_fn)) fprintf(stderr, "emit: warning: no function at --longjmp %08x\n", longjmp_fn);
+
     if (opt->only) {
         const dc_func *f = dc_func_at(a, opt->only);
         if (!f) {
@@ -1223,45 +1377,94 @@ int dc_emit(const dc_analysis *a, const dc_emit_options *opt)
     }
 
     make_dirs(opt->out_dir);
-
-    FILE *h = open_out(opt->out_dir, "funcs.h");
-    if (!h) return 0;
-    fprintf(h, "/* generated by dcrecomp, don't edit */\n#ifndef FUNCS_H\n#define FUNCS_H\n\n#include \"sh4_rt.h\"\n\n");
-    for (int i = 0; i < a->nfuncs; i++)
-        fprintf(h, "void f_%08x(sh4_ctx *ctx);\n", a->funcs[i].start);
-    fprintf(h, "\n#endif\n");
-    fclose(h);
-
-    int per = opt->funcs_per_file > 0 ? opt->funcs_per_file : 200;
-    int nfiles = 0;
-    FILE *out = NULL;
-    for (int i = 0; i < a->nfuncs; i++) {
-        if (i % per == 0) {
-            char name[32];
-            if (out) fclose(out);
-            snprintf(name, sizeof name, "funcs_%03d.c", nfiles++);
-            out = open_out(opt->out_dir, name);
-            if (!out) return 0;
-            fprintf(out, "/* generated by dcrecomp, don't edit */\n#include \"funcs.h\"\n\n");
-        }
-        if (!emit_function(out, a, &a->funcs[i])) {
-            fprintf(stderr, "emit: f_%08x: collect_body() failed\n", a->funcs[i].start);
-            fclose(out);
-            return 0;
-        }
-    }
-    if (out) fclose(out);
-
-    // a->funcs is sorted by address already, so dc_lookup can binary search
-    FILE *l = open_out(opt->out_dir, "lookup.c");
-    if (!l) return 0;
-    fprintf(l, "/* generated by dcrecomp, don't edit */\n#include \"funcs.h\"\n\n");
-    fprintf(l, "const dc_func_entry dc_func_table[] = {\n");
-    for (int i = 0; i < a->nfuncs; i++)
-        fprintf(l, "    { 0x%08xu, f_%08x },\n", a->funcs[i].start, a->funcs[i].start);
-    fprintf(l, "};\n\nconst int dc_func_count = %d;\n", a->nfuncs);
-    fclose(l);
+    int nfiles;
+    if (!emit_set(a, opt->out_dir, "funcs.h", "funcs", "#include \"funcs.h\"\n", "lookup.c",
+                  "dc_func_table", "dc_func_count", opt->funcs_per_file > 0 ? opt->funcs_per_file : 200, &nfiles))
+        return 0;
 
     fprintf(stderr, "emit: %d functions in %d files, written to %s/\n", a->nfuncs, nfiles, opt->out_dir);
     return 1;
+}
+
+// how the runtime tells which module is in memory: FNV-1a of the start of the
+// first function (code doesn't change, the header does)
+static uint32_t fnv1a(const dc_analysis *a, uint32_t addr, uint32_t len)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < len; i += 2) {
+        uint16_t w = 0;
+        dc_read16(a->img, addr + i, &w);
+        h = (h ^ (w & 0xffu)) * 16777619u;
+        h = (h ^ (uint32_t)(w >> 8)) * 16777619u;
+    }
+    return h;
+}
+
+int dc_emit_module(const dc_analysis *a, const dc_analysis *main, const dc_emit_options *opt,
+                   const char *name, dc_module_info *info)
+{
+    char low[32], pre[40], header[48], includes[128], lookup[56], table[48];
+    c_name(low, sizeof low, name);
+    snprintf(pre, sizeof pre, "m_%s", low);
+    snprintf(header, sizeof header, "m_%s.h", low);
+    snprintf(includes, sizeof includes, "#include \"m_%s.h\"\n", low);
+    snprintf(lookup, sizeof lookup, "m_%s_lookup.c", low);
+    snprintf(table, sizeof table, "m_%s_table", low);
+
+    setjmp_fn = opt->setjmp_fn;
+    longjmp_fn = opt->longjmp_fn;
+    prefix = pre;
+    main_a = main;
+
+    memset(info, 0, sizeof *info);
+    snprintf(info->name, sizeof info->name, "%s", name);
+    info->base = a->base;
+    info->size = a->size;
+    for (int i = 0; i < 8; i++) {
+        uint16_t w = 0;
+        dc_read16(a->img, a->base + (uint32_t)(i & ~1), &w);
+        info->magic[i] = (uint8_t)(i & 1 ? w >> 8 : w);
+    }
+    info->nfuncs = a->nfuncs;
+    if (a->nfuncs) {
+        uint32_t s = a->funcs[0].start, len = 0;
+        while (len < 0x100 && s + len - a->base < a->size && a->kind[(s + len - a->base) / 2] == BYTE_CODE)
+            len += 2;
+        info->sig_addr = s;
+        info->sig_len = len;
+        info->sig_hash = fnv1a(a, s, len);
+    }
+
+    make_dirs(opt->out_dir);
+    int nfiles = 0, ok = emit_set(a, opt->out_dir, header, pre, includes, lookup, table, NULL,
+                                  opt->funcs_per_file > 0 ? opt->funcs_per_file : 200, &nfiles);
+    prefix = "f";
+    main_a = NULL;
+    if (ok) fprintf(stderr, "emit: module %s: %d functions in %d files\n", name, a->nfuncs, nfiles);
+    return ok;
+}
+
+int dc_emit_registry(const dc_emit_options *opt, const dc_module_info *mods, int n)
+{
+    char low[32];
+    make_dirs(opt->out_dir);
+    FILE *f = open_out(opt->out_dir, "modules.c");
+    if (!f) return 0;
+    fprintf(f, "/* generated by dcrecomp, don't edit */\n#include \"sh4_rt.h\"\n\n");
+    for (int i = 0; i < n; i++) {
+        c_name(low, sizeof low, mods[i].name);
+        fprintf(f, "extern const dc_func_entry m_%s_table[];\n", low);
+    }
+    fprintf(f, "\nconst dc_module dc_modules[] = {\n");
+    for (int i = 0; i < n; i++) {
+        const dc_module_info *m = &mods[i];
+        c_name(low, sizeof low, m->name);
+        fprintf(f, "    { \"%s\", 0x%08xu, 0x%08xu, {", m->name, m->base, m->size);
+        for (int j = 0; j < 8; j++) fprintf(f, "%s0x%02x", j ? "," : "", m->magic[j]);
+        fprintf(f, "}, 0x%08xu, 0x%xu, 0x%08xu, m_%s_table, %d },\n",
+                m->sig_addr, m->sig_len, m->sig_hash, low, m->nfuncs);
+    }
+    if (!n) fprintf(f, "    { 0 }\n");
+    fprintf(f, "};\n\nconst int dc_module_count = %d;\n", n);
+    return close_out(f, opt->out_dir, "modules.c");
 }

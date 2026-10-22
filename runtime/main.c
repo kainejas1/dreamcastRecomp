@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 void f_8c010000(sh4_ctx *ctx);   // every game starts here
 
@@ -42,25 +43,57 @@ static void stop(const sh4_ctx *ctx, const char *fmt, ...)
     va_end(ap);
     fprintf(stderr, "\n");
     dump(ctx);
-    // DC_DUMP=file: write main RAM out for looking at with a hex editor/disasm
+    // DC_DUMP=file: write main RAM out for looking at with a hex editor/disasm.
+    // sound RAM follows it (file offset 0x1000000)
     const char *path = getenv("DC_DUMP");
     if (path) {
         FILE *f = fopen(path, "wb");
-        if (f) { fwrite(dc_ram, 1, DC_RAM_SIZE, f); fclose(f); fprintf(stderr, "  RAM dumped to %s\n", path); }
+        if (f) { fwrite(dc_ram, 1, DC_RAM_SIZE, f); fwrite(dc_aram, 1, DC_ARAM_SIZE, f); fclose(f); fprintf(stderr, "  RAM dumped to %s\n", path); }
     }
     exit(1);
 }
 
 // ---- computed calls and jumps ----
 
-sh4_func dc_lookup(uint32_t addr)
+static sh4_func find_in(const dc_func_entry *t, int n, uint32_t addr)
 {
-    int lo = 0, hi = dc_func_count - 1;
+    int lo = 0, hi = n - 1;
     while (lo <= hi) {
         int mid = lo + (hi - lo) / 2;
-        if (dc_func_table[mid].addr < addr) lo = mid + 1;
-        else if (dc_func_table[mid].addr > addr) hi = mid - 1;
-        else return dc_func_table[mid].fn;
+        if (t[mid].addr < addr) lo = mid + 1;
+        else if (t[mid].addr > addr) hi = mid - 1;
+        else return t[mid].fn;
+    }
+    return NULL;
+}
+
+// is this module the one in memory right now?
+static int module_loaded(const dc_module *m)
+{
+    const uint8_t *head = mem_ptr(m->base, 8), *code = mem_ptr(m->sig_addr, m->sig_len);
+    if (!head || !code || memcmp(head, m->magic, 8)) return 0;
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < m->sig_len; i++)
+        h = (h ^ code[i]) * 16777619u;
+    return h == m->sig_hash;
+}
+
+sh4_func dc_lookup(uint32_t addr)
+{
+    static const dc_module *current;   // last module used, checked again every time
+
+    sh4_func f = find_in(dc_func_table, dc_func_count, addr);
+    if (f) return f;
+
+    if (current && addr - current->base < current->size && module_loaded(current))
+        return find_in(current->funcs, current->nfuncs, addr);
+    for (int i = 0; i < dc_module_count; i++) {
+        const dc_module *m = &dc_modules[i];
+        if (addr - m->base < m->size && module_loaded(m)) {
+            if (m != current) fprintf(stderr, "[mod] %s is loaded\n", m->name);
+            current = m;
+            return find_in(m->funcs, m->nfuncs, addr);
+        }
     }
     return NULL;
 }

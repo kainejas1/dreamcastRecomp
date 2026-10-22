@@ -40,6 +40,9 @@ void dc_image_free(dc_image *img);
  * analysed and recompiled at the address they run from. */
 int  dc_image_copy(dc_image *img, uint32_t dest, uint32_t src, uint32_t len, char *err, size_t errlen);
 
+/* Another known function start (a module's entry points). */
+int  dc_image_add_root(dc_image *img, uint32_t addr);
+
 /* Translate a virtual address to an offset into img->ram. Returns 0 if
  * the address is not in main RAM. */
 int dc_ram_offset(uint32_t addr, uint32_t *off);
