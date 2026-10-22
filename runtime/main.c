@@ -14,6 +14,7 @@
 #include "holly.h"
 #include "memory.h"
 #include "sh4_rt.h"
+#include "video.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -153,6 +154,7 @@ void dc_service_irq(sh4_ctx *ctx)
     if (max_frames && holly_frame_count() >= max_frames)
         stop(ctx, "ran %u frames (DC_FRAMES), %llu interrupts taken", holly_frame_count(), interrupts);
     aica_update();
+    video_frame();
 
     int level = holly_pending_level();
     uint32_t sr = sh4_get_sr(ctx);
@@ -198,6 +200,7 @@ void dc_trace_enter(uint32_t addr, uint32_t sp)
 static void summary(void)
 {
     fprintf(stderr, "[run] %u frames, %llu interrupts taken\n", holly_frame_count(), interrupts);
+    video_shutdown();
 #ifdef DC_TRACE
     fprintf(stderr, "[run] last functions entered (function/sp):");
     for (unsigned i = 0; i < 64; i++) {
@@ -274,6 +277,7 @@ int main(int argc, char **argv)
 
     if (getenv("DC_FRAMES")) max_frames = (uint32_t)strtoul(getenv("DC_FRAMES"), NULL, 0);
     atexit(summary);
+    video_init();
 
     fprintf(stderr, "starting at 8c010000 (%d recompiled functions)\n", dc_func_count);
     f_8c010000(&cpu);

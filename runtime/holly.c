@@ -1,5 +1,6 @@
 #include "holly.h"
 #include "memory.h"
+#include "pvr.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,10 @@ static uint32_t frame_count;   // vblank-ins seen
 static int clock_ready;
 
 uint32_t holly_frame_count(void) { return frame_count; }
+
+uint32_t holly_reg(uint32_t address) { return holly_regs[(address - HOLLY_REG_BASE) / 4u]; }
+void holly_set_reg(uint32_t address, uint32_t value) { holly_regs[(address - HOLLY_REG_BASE) / 4u] = value; }
+void holly_raise(uint32_t bits) { holly_regs[(HOLLY_SB_ISTNRM - HOLLY_REG_BASE) / 4u] |= bits; }
 
 // DC_HOLLYLOG=1: log register accesses (not SPG_STATUS polling), first 3000
 static int reglog;
@@ -265,6 +270,11 @@ void holly_write32(uint32_t address, uint32_t value)
         if (holly_regs[(G2_DMA_BASE + ch * 0x20u + 0x14u - HOLLY_REG_BASE) / 4u] & 1)
             g2_dma(ch);
     }
+
+    // PowerVR registers (TA list init, start render, ...) and the ch2 DMA
+    // that feeds the TA
+    if (address >= 0x005f8000u || address == PVR_SB_C2DST)
+        pvr_reg_written(address, value);
 
     if (address == HOLLY_SPG_LOAD) {
         uint32_t lines = (value >> 16) & 0x3ffu;

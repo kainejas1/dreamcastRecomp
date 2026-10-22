@@ -45,4 +45,10 @@ int holly_pending_level(void);
 /* Number of vblank-ins so far (frames). */
 uint32_t holly_frame_count(void);
 
+/* Raw register value, no side effects (for the PowerVR code). */
+uint32_t holly_reg(uint32_t address);
+void holly_set_reg(uint32_t address, uint32_t value);
+/* Set bits in SB_ISTNRM (an interrupt happened: list done, DMA end, ...). */
+void holly_raise(uint32_t bits);
+
 #endif

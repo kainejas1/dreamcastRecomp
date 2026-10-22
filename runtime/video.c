@@ -1,0 +1,201 @@
+#include "video.h"
+#include "holly.h"
+#include "memory.h"
+#include "pvr.h"
+
+#include <SDL3/SDL.h>
+#define SDL_MAIN_HANDLED   // main() is ours, SDL just has to be told
+#include <SDL3/SDL_main.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static SDL_Window *window;
+static SDL_Renderer *renderer;
+static SDL_Texture *texture;
+static int tex_w, tex_h;
+static uint32_t last_frame = ~0u;
+
+static uint32_t *pixels;
+static int pix_cap;
+
+// the screen as ARGB8888: FB_R_SOF1 (and SOF2 for the odd lines when
+// interlaced), FB_R_SIZE, FB_R_CTRL's pixel format
+static int read_screen(int *w, int *h)
+{
+    uint32_t ctrl = holly_reg(PVR_FB_R_CTRL), size = holly_reg(PVR_FB_R_SIZE);
+    if (!(ctrl & 1)) return 0;   // display off
+    int depth = (ctrl >> 2) & 3;
+    int bpp = depth == 0 || depth == 1 ? 2 : depth == 2 ? 3 : 4;
+    uint32_t xwords = (size & 0x3ff) + 1, lines = ((size >> 10) & 0x3ff) + 1, mod = (size >> 20) & 0x3ff;
+    uint32_t stride = (xwords + mod - 1) * 4;
+    int interlace = (holly_reg(PVR_SPG_CONTROL) >> 4) & 1;
+    *w = (int)(xwords * 4 / (uint32_t)bpp);
+    *h = (int)lines * (interlace ? 2 : 1);
+    if (*w <= 0 || *h <= 0 || *w > 2048 || *h > 2048) return 0;
+    if (*w * *h > pix_cap) {
+        pix_cap = *w * *h;
+        pixels = realloc(pixels, (size_t)pix_cap * 4);
+        if (!pixels) return 0;
+    }
+
+    for (int y = 0; y < *h; y++) {
+        uint32_t line = interlace ? (uint32_t)y / 2 : (uint32_t)y;
+        uint32_t base = (interlace && (y & 1) ? holly_reg(PVR_FB_R_SOF2) : holly_reg(PVR_FB_R_SOF1)) & 0x00fffffcu;
+        for (int x = 0; x < *w; x++) {
+            uint32_t o = (base + line * stride + (uint32_t)(x * bpp)) & (DC_VRAM_SIZE - 1), c = 0, r, g, b;
+            if (o + 4 <= DC_VRAM_SIZE) memcpy(&c, &dc_vram[o], (size_t)bpp);
+            switch (depth) {
+            case 0:   // 0555
+                r = (c >> 10) & 31; g = (c >> 5) & 31; b = c & 31;
+                c = (r << 3 | r >> 2) << 16 | (g << 3 | g >> 2) << 8 | (b << 3 | b >> 2);
+                break;
+            case 1:   // 565
+                r = (c >> 11) & 31; g = (c >> 5) & 63; b = c & 31;
+                c = (r << 3 | r >> 2) << 16 | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2);
+                break;
+            default:  // 888, 0888
+                c &= 0xffffff;
+                break;
+            }
+            pixels[y * *w + x] = 0xff000000u | c;
+        }
+    }
+    return 1;
+}
+
+void video_init(void)
+{
+    if (getenv("DC_NOWINDOW")) return;
+    SDL_SetMainReady();
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        fprintf(stderr, "[video] SDL_Init failed: %s, running without a window\n", SDL_GetError());
+        return;
+    }
+    if (!SDL_CreateWindowAndRenderer("dcrecomp", 1280, 960, SDL_WINDOW_RESIZABLE, &window, &renderer)) {
+        fprintf(stderr, "[video] no window: %s\n", SDL_GetError());
+        window = NULL;
+        renderer = NULL;
+    }
+}
+
+void video_frame(void)
+{
+    uint32_t frame = holly_frame_count();
+    if (frame == last_frame) return;
+    last_frame = frame;
+    if (!renderer) return;
+
+    SDL_Event e;
+    while (SDL_PollEvent(&e))
+        if (e.type == SDL_EVENT_QUIT) exit(0);
+
+    int w, h;
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderClear(renderer);
+    if (read_screen(&w, &h)) {
+        if (!texture || w != tex_w || h != tex_h) {
+            if (texture) SDL_DestroyTexture(texture);
+            texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+            tex_w = w;
+            tex_h = h;
+            SDL_SetRenderLogicalPresentation(renderer, 640, 480, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+        }
+        if (texture) {
+            SDL_UpdateTexture(texture, NULL, pixels, w * 4);
+            SDL_RenderTexture(renderer, texture, NULL, NULL);
+        }
+    }
+    SDL_RenderPresent(renderer);
+}
+
+// ---- PNG, uncompressed (stored deflate blocks), so no zlib needed ----
+
+static uint32_t crc_table[256];
+
+static uint32_t crc(uint32_t c, const uint8_t *p, size_t n)
+{
+    if (!crc_table[1])
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t v = i;
+            for (int k = 0; k < 8; k++) v = v & 1 ? 0xedb88320u ^ (v >> 1) : v >> 1;
+            crc_table[i] = v;
+        }
+    c = ~c;
+    while (n--) c = crc_table[(c ^ *p++) & 0xff] ^ (c >> 8);
+    return ~c;
+}
+
+static void be32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+
+static void chunk(FILE *f, const char *type, const uint8_t *data, uint32_t len)
+{
+    uint8_t h[8];
+    be32(h, len);
+    memcpy(h + 4, type, 4);
+    fwrite(h, 1, 8, f);
+    if (len) fwrite(data, 1, len, f);
+    uint32_t c = crc(crc(0, (const uint8_t *)type, 4), data, len);
+    be32(h, c);
+    fwrite(h, 1, 4, f);
+}
+
+static int save_png(const char *path, const uint32_t *px, int w, int h)
+{
+    size_t row = (size_t)w * 3 + 1, raw_len = row * (size_t)h;
+    uint8_t *raw = malloc(raw_len);
+    if (!raw) return 0;
+    for (int y = 0; y < h; y++) {
+        uint8_t *r = raw + row * (size_t)y;
+        *r++ = 0;   // no filter
+        for (int x = 0; x < w; x++) {
+            uint32_t c = px[y * w + x];
+            *r++ = (uint8_t)(c >> 16); *r++ = (uint8_t)(c >> 8); *r++ = (uint8_t)c;
+        }
+    }
+
+    size_t nblocks = (raw_len + 65534) / 65535, zlen = 2 + raw_len + nblocks * 5 + 4;
+    uint8_t *z = malloc(zlen), *p = z;
+    if (!z) { free(raw); return 0; }
+    *p++ = 0x78; *p++ = 0x01;
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < raw_len; i += 65535) {
+        size_t n = raw_len - i < 65535 ? raw_len - i : 65535;
+        *p++ = i + n == raw_len;
+        *p++ = (uint8_t)n; *p++ = (uint8_t)(n >> 8);
+        *p++ = (uint8_t)~n; *p++ = (uint8_t)(~n >> 8);
+        memcpy(p, raw + i, n);
+        p += n;
+    }
+    for (size_t i = 0; i < raw_len; i++) { a = (a + raw[i]) % 65521; b = (b + a) % 65521; }
+    be32(p, b << 16 | a);
+    p += 4;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(raw); free(z); return 0; }
+    uint8_t ihdr[13];
+    be32(ihdr, (uint32_t)w);
+    be32(ihdr + 4, (uint32_t)h);
+    ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;   // 8-bit RGB
+    fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
+    chunk(f, "IHDR", ihdr, 13);
+    chunk(f, "IDAT", z, (uint32_t)(p - z));
+    chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    free(raw);
+    free(z);
+    return 1;
+}
+
+void video_shutdown(void)
+{
+    const char *path = getenv("DC_SHOT");
+    int w, h;
+    if (path) {
+        if (read_screen(&w, &h) && save_png(path, pixels, w, h))
+            fprintf(stderr, "  screen (%dx%d, %u frames rendered) saved to %s\n", w, h, pvr_render_count(), path);
+        else
+            fprintf(stderr, "  no screen to save (display off?)\n");
+    }
+}

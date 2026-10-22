@@ -1,6 +1,7 @@
 #include "memory.h"
 #include "aica.h"
 #include "holly.h"
+#include "pvr.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -59,6 +60,7 @@ void mem_init(void)
     memset(dc_ram, 0, sizeof dc_ram);
     holly_init();
     aica_init();
+    pvr_init();
 }
 
 /* P0/P1/P2 aliases of the 0x0c000000 main-RAM window map to the
@@ -315,6 +317,12 @@ void mem_w8(uint32_t address, uint8_t value)
         return;
     }
 
+    // area 4: TA FIFO and the texture path
+    if (address < 0xe0000000u && pvr_ta_handles(address & 0x1fffffffu)) {
+        pvr_ta_write(address & 0x1fffffffu, value, 1);
+        return;
+    }
+
     if (is_register(address)) {
         uint32_t a = address & ~3u;
         uint32_t shift = (address & 3u) * 8u;
@@ -354,6 +362,12 @@ void mem_w16(uint32_t address, uint16_t value)
 
     if (aram_offset(address, 2, &o)) {
         memcpy(&dc_aram[o], &value, 2);
+        return;
+    }
+
+    // area 4: TA FIFO and the texture path
+    if (address < 0xe0000000u && pvr_ta_handles(address & 0x1fffffffu)) {
+        pvr_ta_write(address & 0x1fffffffu, value, 2);
         return;
     }
 
@@ -403,6 +417,12 @@ void mem_w32(uint32_t address, uint32_t value)
 
     if ((address & 0xfc000000u) == 0xe0000000u) {
         store_queue[(address >> 5) & 1u][(address >> 2) & 7u] = value;
+        return;
+    }
+
+    // area 4: TA FIFO and the texture path
+    if (address < 0xe0000000u && pvr_ta_handles(address & 0x1fffffffu)) {
+        pvr_ta_write(address & 0x1fffffffu, value, 4);
         return;
     }
 
