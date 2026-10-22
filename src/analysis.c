@@ -406,7 +406,13 @@ static int trace_func(ctx *c, uint32_t start, uint32_t *end)
                 break;
             case SH4_OP_BRA:
                 visit_slot(a, slot, end);
-                ok = push(&blocks, in.target);
+                // bra over nothing but its own slot: a tail call into the
+                // function placed right after (the slot restores a register).
+                // Those can be called on their own too (SA2's 8c15a29e)
+                if (in.target == slot + 2 && in.target != start)
+                    ok = add_func(c, in.target, FUNC_FROM_TAIL);
+                else
+                    ok = push(&blocks, in.target);
                 break;
             case SH4_OP_BSR:
                 ok = add_func(c, in.target, FUNC_FROM_BSR);
