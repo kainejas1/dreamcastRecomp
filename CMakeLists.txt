@@ -25,6 +25,7 @@ if(DC_GAME_SRC)
   add_executable(sa2
     runtime/main.c
     runtime/aica.c
+    runtime/arm7.c
     runtime/bios.c
     runtime/coro.c
     runtime/gdrom.c
