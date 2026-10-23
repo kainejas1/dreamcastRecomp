@@ -45,6 +45,9 @@ int holly_pending_level(void);
 /* Number of vblank-ins so far (frames). */
 uint32_t holly_frame_count(void);
 
+/* Microseconds since start, on the video clock. */
+uint64_t holly_clock_us(void);
+
 /* Raw register value, no side effects (for the PowerVR code). */
 uint32_t holly_reg(uint32_t address);
 void holly_set_reg(uint32_t address, uint32_t value);

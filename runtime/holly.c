@@ -88,6 +88,14 @@ void holly_init(void)
         = (480u << 16) | 240u;
 }
 
+// microseconds of the video clock (the AICA runs its samples off it)
+uint64_t holly_clock_us(void)
+{
+    if (!clock_ready) return 0;
+    uint64_t t = host_ticks() - start_ticks;
+    return t / host_frequency * 1000000u + t % host_frequency * 1000000u / host_frequency;
+}
+
 int holly_handles(uint32_t address)
 {
     return address >= HOLLY_REG_BASE
