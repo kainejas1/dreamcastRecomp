@@ -32,4 +32,8 @@ typedef struct {
 
 void video_pad(dc_pad *pad);
 
+/* 44.1 kHz stereo samples from the AICA, to the speakers.
+ *   DC_WAV=file   also write them to a .wav (works without a window) */
+void video_audio(const short *stereo, int frames);
+
 #endif

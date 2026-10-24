@@ -2,6 +2,8 @@
 #include "arm7.h"
 #include "holly.h"
 #include "memory.h"
+#include "aica_chan.h"
+#include "video.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,6 +85,7 @@ void aica_init(void)
 {
     static const arm7_bus bus = { arm_bus_r8, arm_bus_r32, arm_bus_w8, arm_bus_w32, NULL };
     memset(regs, 0, sizeof regs);
+    aica_chan_init(regs);
     driver_port = 0;
     arm_running = 0;
     fake_driver = getenv("DC_FAKEDRIVER") != NULL;
@@ -178,7 +181,12 @@ void aica_update(void)
         if (target - samples_done > 4410) samples_done = target - 4410;
         while (samples_done < target) {
             unsigned batch = target - samples_done > 16 ? 16 : (unsigned)(target - samples_done);
-            for (unsigned i = 0; i < batch; i++) tick_sample();
+            int16_t pcm[16 * 2];
+            for (unsigned i = 0; i < batch; i++) {
+                tick_sample();
+                aica_chan_sample(&pcm[i * 2]);
+            }
+            video_audio(pcm, (int)batch);
             update_interrupts();
             arm7_run((int)batch * ARM_PER_SAMPLE);
             samples_done += batch;
@@ -209,8 +217,8 @@ uint32_t aica_read32(uint32_t phys)
     if (phys == RTC_LO) return rtc_now() & 0xffffu;
     if (phys >= RTC_BASE) return 0;
     uint32_t off = phys - AICA_REG_BASE;
-    if (off == R_SLOT_INFO) return 0x7fff;   // no channels yet: every one released and silent
-    if (off == R_SLOT_POS) return 0;
+    if (off == R_SLOT_INFO) return aica_chan_info();
+    if (off == R_SLOT_POS) return aica_chan_pos();
     return regs[off / 4];
 }
 
@@ -229,6 +237,13 @@ void aica_write32(uint32_t phys, uint32_t value)
     case R_MCIPD: REG(R_MCIPD) |= value & 0x20u; update_interrupts(); return;
     case R_INTREQ: return;
     case R_INTCLEAR: update_interrupts(); return;
+    }
+    if (off < 0x2000u && (off % 0x80u) == 0 &&
+        (value & 0x8000u)) {
+        /* KYONEX triggers key-on/key-off for all channels. */
+        regs[off / 4] = value & ~0x8000u;
+        aica_chan_keyon();
+        return;
     }
     regs[off / 4] = value;
     if (off >= R_TIMA && off <= R_TIMA + 8) timer_div[(off - R_TIMA) / 4] = 0;

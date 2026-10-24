@@ -138,15 +138,52 @@ void video_pad(dc_pad *pad)
     }
 }
 
+// ---- audio ----
+
+static SDL_AudioStream *audio;
+static FILE *wav;
+static uint32_t wav_bytes;
+
+static void le32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
+
+// 44-byte header for 44.1 kHz 16-bit stereo, `bytes` of samples after it
+static void wav_header(FILE *f, uint32_t bytes)
+{
+    uint8_t h[44];
+    memcpy(h, "RIFF", 4); le32(h + 4, 36 + bytes); memcpy(h + 8, "WAVEfmt ", 8);
+    le32(h + 16, 16); h[20] = 1; h[21] = 0; h[22] = 2; h[23] = 0;   // PCM, 2 channels
+    le32(h + 24, 44100); le32(h + 28, 44100 * 4); h[32] = 4; h[33] = 0; h[34] = 16; h[35] = 0;
+    memcpy(h + 36, "data", 4); le32(h + 40, bytes);
+    fwrite(h, 1, sizeof h, f);
+}
+
+void video_audio(const short *stereo, int frames)
+{
+    static int wav_tried;
+    if (!wav_tried) {
+        wav_tried = 1;
+        if (getenv("DC_WAV") && (wav = fopen(getenv("DC_WAV"), "wb"))) wav_header(wav, 0);
+    }
+    if (wav) { fwrite(stereo, 4, (size_t)frames, wav); wav_bytes += (uint32_t)frames * 4; }
+
+    // more than a quarter second waiting (we ran ahead): drop it rather than lag behind
+    if (audio && SDL_GetAudioStreamQueued(audio) < 44100)
+        SDL_PutAudioStreamData(audio, stereo, frames * 4);
+}
+
 void video_init(void)
 {
     parse_presses();
     if (getenv("DC_NOWINDOW")) return;
     SDL_SetMainReady();
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         fprintf(stderr, "[video] SDL_Init failed: %s, running without a window\n", SDL_GetError());
         return;
     }
+    SDL_AudioSpec spec = { SDL_AUDIO_S16, 2, 44100 };
+    audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (audio) SDL_ResumeAudioStreamDevice(audio);
+    else fprintf(stderr, "[video] no audio: %s\n", SDL_GetError());
     if (!SDL_CreateWindowAndRenderer("dcrecomp", 1280, 960, SDL_WINDOW_RESIZABLE, &window, &renderer)) {
         fprintf(stderr, "[video] no window: %s\n", SDL_GetError());
         window = NULL;
@@ -270,6 +307,13 @@ static int save_png(const char *path, const uint32_t *px, int w, int h)
 
 void video_shutdown(void)
 {
+    if (wav) {
+        fseek(wav, 0, SEEK_SET);
+        wav_header(wav, wav_bytes);
+        fclose(wav);
+        wav = NULL;
+        fprintf(stderr, "  audio (%.1f s) saved to %s\n", wav_bytes / 4 / 44100.0, getenv("DC_WAV"));
+    }
     const char *path = getenv("DC_SHOT");
     int w, h;
     if (path) {
