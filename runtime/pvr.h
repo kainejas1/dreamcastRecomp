@@ -31,8 +31,12 @@
 #define PVR_FB_X_CLIP      0x005f8068u
 #define PVR_FB_Y_CLIP      0x005f806cu
 #define PVR_FPU_SHAD_SCALE 0x005f8074u   /* bit 8: intensity shadows; 7-0: their scale / 256 */
-#define PVR_FPU_PARAM_CFG  0x005f807cu   /* bit 21: region array entries are 6 words (type 2) */
-#define PVR_ISP_FEED_CFG   0x005f8098u   /* bit 0: translucent list in pre-sort (sent) order, else sorted */
+#define PVR_FOG_COL_RAM    0x005f80b0u   /* table fog colour, RGB */
+#define PVR_FOG_COL_VERT   0x005f80b4u   /* per-vertex fog colour */
+#define PVR_FOG_DENSITY    0x005f80b8u   /* 15-8 mantissa / 128, 7-0 signed exponent */
+#define PVR_FOG_CLAMP_MAX  0x005f80bcu   /* colour clamp (TSP bit 21), ARGB */
+#define PVR_FOG_CLAMP_MIN  0x005f80c0u
+#define PVR_FOG_TABLE      0x005f8200u   /* 128 entries: two 8-bit fog values each */
 #define PVR_FPU_PARAM_CFG  0x005f807cu   /* bit 21: region array entries are 6 words (type 2) */
 #define PVR_ISP_FEED_CFG   0x005f8098u   /* bit 0: translucent list in pre-sort (sent) order, else sorted */
 #define PVR_ISP_BACKGND_D  0x005f8088u

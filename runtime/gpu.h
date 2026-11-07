@@ -18,10 +18,10 @@
  * order sent, textures (all formats, decoded on the CPU and cached until their
  * VRAM changes), point or bilinear filtering, clamp/flip/repeat, the four
  * shading modes, offset colour, every depth compare and blend factor, the
- * opaque list's modifier volumes (stencil shadows), and the translucent list
- * sorted back to front by triangle (pvr.c sorts per pixel).
- * Not yet: fog, the translucent list's volumes, two-volume polygons' second
- * colours, mipmaps.
+ * opaque list's modifier volumes (stencil shadows), the translucent list
+ * sorted back to front by triangle (pvr.c sorts per pixel), fog and the colour
+ * clamp, and mipmaps from the game's own levels.
+ * Not yet: the translucent list's volumes, two-volume polygons' second colours.
  */
 
 struct SDL_Window;

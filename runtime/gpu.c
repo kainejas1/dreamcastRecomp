@@ -22,7 +22,7 @@ static SDL_Window *win;
 static int active, fixed_scale;
 static SDL_GPUShader *vs, *fs;
 static SDL_GPUTexture *white;         // bound when a strip has no texture
-static SDL_GPUSampler *samplers[2][3][3];   // filter, u, v address modes
+static SDL_GPUSampler *samplers[3][2][16][3][3];   // filter, mipmapped, LOD adjust, u, v address modes
 static SDL_GPUGraphicsPipeline *pipes[4096];
 static SDL_GPUTextureFormat depth_format;   // with 8 stencil bits, for modifier volumes
 static uint32_t renders;
@@ -38,17 +38,22 @@ static SDL_GPUShader *shader(const unsigned char *code, size_t size, SDL_GPUShad
     return SDL_CreateGPUShader(dev, &ci);
 }
 
-static SDL_GPUTexture *texture(int w, int h, SDL_GPUTextureFormat format, SDL_GPUTextureUsageFlags usage)
+static SDL_GPUTexture *texture_levels(int w, int h, int levels, SDL_GPUTextureFormat format, SDL_GPUTextureUsageFlags usage)
 {
     SDL_GPUTextureCreateInfo ci = {
         .type = SDL_GPU_TEXTURETYPE_2D, .format = format, .usage = usage,
-        .width = (Uint32)w, .height = (Uint32)h, .layer_count_or_depth = 1, .num_levels = 1,
+        .width = (Uint32)w, .height = (Uint32)h, .layer_count_or_depth = 1, .num_levels = (Uint32)levels,
     };
     return SDL_CreateGPUTexture(dev, &ci);
 }
 
-// copy w x h ARGB8888 into tex (in a copy pass of cmd)
-static void upload(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *tex, const uint32_t *argb, int w, int h)
+static SDL_GPUTexture *texture(int w, int h, SDL_GPUTextureFormat format, SDL_GPUTextureUsageFlags usage)
+{
+    return texture_levels(w, h, 1, format, usage);
+}
+
+// copy w x h ARGB8888 into mip level `level` of tex (in a copy pass of cmd)
+static void upload_level(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *tex, const uint32_t *argb, int w, int h, int level)
 {
     SDL_GPUTransferBufferCreateInfo ti = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = (Uint32)(w * h * 4) };
     SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(dev, &ti);
@@ -59,11 +64,38 @@ static void upload(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *tex, const uint32_
         SDL_UnmapGPUTransferBuffer(dev, tb);
         SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
         SDL_GPUTextureTransferInfo src = { .transfer_buffer = tb, .pixels_per_row = (Uint32)w, .rows_per_layer = (Uint32)h };
-        SDL_GPUTextureRegion dst = { .texture = tex, .w = (Uint32)w, .h = (Uint32)h, .d = 1 };
+        SDL_GPUTextureRegion dst = { .texture = tex, .mip_level = (Uint32)level, .w = (Uint32)w, .h = (Uint32)h, .d = 1 };
         SDL_UploadToGPUTexture(cp, &src, &dst, false);
         SDL_EndGPUCopyPass(cp);
     }
     SDL_ReleaseGPUTransferBuffer(dev, tb);   // freed once the GPU is done with it
+}
+
+static void upload(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *tex, const uint32_t *argb, int w, int h)
+{
+    upload_level(cmd, tex, argb, w, h, 0);
+}
+
+// filter: 0 point, 1 bilinear, 2 trilinear (TSP 14-13). lod: TSP's mip-map D
+// adjust, in quarters (4 = 1.0, no bias)
+static SDL_GPUSampler *sampler_for(int filter, int mipmapped, int lod, int u, int v)
+{
+    SDL_GPUSampler **s = &samplers[filter][mipmapped][lod][u][v];
+    if (*s) return *s;
+    static const SDL_GPUSamplerAddressMode modes[3] = {
+        SDL_GPU_SAMPLERADDRESSMODE_REPEAT, SDL_GPU_SAMPLERADDRESSMODE_MIRRORED_REPEAT, SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+    };
+    SDL_GPUSamplerCreateInfo si = {
+        .min_filter = filter ? SDL_GPU_FILTER_LINEAR : SDL_GPU_FILTER_NEAREST,
+        .mag_filter = filter ? SDL_GPU_FILTER_LINEAR : SDL_GPU_FILTER_NEAREST,
+        .mipmap_mode = filter == 2 ? SDL_GPU_SAMPLERMIPMAPMODE_LINEAR : SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+        .address_mode_u = modes[u], .address_mode_v = modes[v], .address_mode_w = modes[0],
+        .mip_lod_bias = mipmapped && lod ? log2f((float)lod / 4.0f) : 0.0f,
+        .min_lod = 0.0f,
+        .max_lod = mipmapped ? 16.0f : 0.0f,
+    };
+    *s = SDL_CreateGPUSampler(dev, &si);
+    return *s;
 }
 
 int gpu_init(SDL_Window *window)
@@ -102,26 +134,12 @@ int gpu_init(SDL_Window *window)
     }
 
     vs = shader(pvr_vert_spv, sizeof pvr_vert_spv, SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
-    fs = shader(pvr_frag_spv, sizeof pvr_frag_spv, SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
+    fs = shader(pvr_frag_spv, sizeof pvr_frag_spv, SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 2);
     white = texture(1, 1, FORMAT, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     if (!vs || !fs || !white) {
         fprintf(stderr, "[gpu] setup failed (%s), drawing in software\n", SDL_GetError());
         return 0;
     }
-    static const SDL_GPUSamplerAddressMode modes[3] = {
-        SDL_GPU_SAMPLERADDRESSMODE_REPEAT, SDL_GPU_SAMPLERADDRESSMODE_MIRRORED_REPEAT, SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-    };
-    for (int f = 0; f < 2; f++)
-        for (int u = 0; u < 3; u++)
-            for (int v = 0; v < 3; v++) {
-                SDL_GPUSamplerCreateInfo si = {
-                    .min_filter = f ? SDL_GPU_FILTER_LINEAR : SDL_GPU_FILTER_NEAREST,
-                    .mag_filter = f ? SDL_GPU_FILTER_LINEAR : SDL_GPU_FILTER_NEAREST,
-                    .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
-                    .address_mode_u = modes[u], .address_mode_v = modes[v], .address_mode_w = modes[0],
-                };
-                samplers[f][u][v] = SDL_CreateGPUSampler(dev, &si);
-            }
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
     uint32_t px = 0xffffffffu;
     upload(cmd, white, &px, 1, 1);
@@ -301,7 +319,7 @@ static SDL_GPUTexture *get_texture(SDL_GPUCommandBuffer *cmd, uint32_t tsp, uint
     uint64_t content = pvr_texture_hash(tsp, tcw);
     if (slot && slot->hash == content) { slot->checked = slot->used = renders; return slot->t; }
 
-    int w, hgt;
+    int w, hgt, levels = pvr_texture_levels(tsp, tcw);
     pvr_texture_size(tsp, &w, &hgt);
     if (!slot) {
         // never one this render already uses: its draws are recorded but not bound yet
@@ -310,15 +328,22 @@ static SDL_GPUTexture *get_texture(SDL_GPUCommandBuffer *cmd, uint32_t tsp, uint
         if (slot->t) SDL_ReleaseGPUTexture(dev, slot->t);
         slot->t = NULL;
     }
-    if (!slot->t) slot->t = texture(w, hgt, FORMAT, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+    if (!slot->t) slot->t = texture_levels(w, hgt, levels, FORMAT, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     if (!slot->t) return white;
     if (w * hgt > decoded_cap) {
         decoded_cap = w * hgt;
         decoded = realloc(decoded, (size_t)decoded_cap * 4);
         if (!decoded) { decoded_cap = 0; return white; }
     }
-    pvr_texture_decode(tsp, tcw, decoded);
-    upload(cmd, slot->t, decoded, w, hgt);
+    if (levels == 1) {
+        pvr_texture_decode(tsp, tcw, decoded);
+        upload(cmd, slot->t, decoded, w, hgt);
+    } else {
+        for (int l = 0; l < levels; l++) {   // GPU level 0 is the largest, 2^(levels-1)
+            pvr_texture_decode_level(tsp, tcw, l, decoded);
+            upload_level(cmd, slot->t, decoded, 1 << l, 1 << l, levels - 1 - l);
+        }
+    }
     slot->key = key;
     slot->hash = content;
     slot->checked = slot->used = renders;
@@ -406,7 +431,7 @@ static void draw_range(SDL_GPURenderPass *rp, SDL_GPUGraphicsPipeline *p, Uint8 
 // order pvr.c's draw_modvols takes them
 static void draw_modvols(SDL_GPUCommandBuffer *cmd, SDL_GPURenderPass *rp, const pvr_frame *f, int mv_base)
 {
-    static const int32_t none[8] = { 0 };
+    static const int32_t none[8] = { 0, 0, 2, 0 };   // untextured, no fog
     SDL_PushGPUFragmentUniformData(cmd, 0, none, sizeof none);
     int base = -1;
     for (int i = 0; i < f->nm; i++) {
@@ -422,7 +447,7 @@ static void draw_modvols(SDL_GPUCommandBuffer *cmd, SDL_GPURenderPass *rp, const
         }
     }
     if (f->shadow_on) {
-        strip_uniforms u = { { 2 | 8, 0, 0, 0 }, { 0, 0, 0, 0 } };   // gouraud colour, with its alpha
+        strip_uniforms u = { { 2 | 8, 0, 2, 0 }, { 0, 0, 0, 0 } };   // gouraud colour, with its alpha, no fog
         SDL_PushGPUFragmentUniformData(cmd, 0, &u, sizeof u);
         draw_range(rp, mv_pipeline(MV_SHADE), 0x81, mv_base + f->nmv, 6);
     }
@@ -611,6 +636,24 @@ void gpu_render(const pvr_frame *f)
         SDL_SetGPUScissor(rp, &clip);
         float screen[4] = { 2.0f / (float)f->width, 2.0f / (float)f->height, DEPTH_SCALE, 0 };
         SDL_PushGPUVertexUniformData(cmd, 0, screen, sizeof screen);
+        struct {
+            float ram[4], vert[4], clamp_min[4], clamp_max[4], param[4], table[256];
+        } fog;
+        const uint32_t regs[4] = { f->fog_col_ram, f->fog_col_vert, f->clamp_min, f->clamp_max };
+        float *dst[4] = { fog.ram, fog.vert, fog.clamp_min, fog.clamp_max };
+        for (int i = 0; i < 4; i++) {
+            dst[i][0] = ((regs[i] >> 16) & 0xff) / 255.0f;
+            dst[i][1] = ((regs[i] >> 8) & 0xff) / 255.0f;
+            dst[i][2] = (regs[i] & 0xff) / 255.0f;
+            dst[i][3] = (regs[i] >> 24) / 255.0f;
+        }
+        fog.param[0] = f->fog_density;
+        fog.param[1] = fog.param[2] = fog.param[3] = 0;
+        for (int i = 0; i < 128; i++) {
+            fog.table[2 * i] = (float)(f->fog_table[i] >> 8);
+            fog.table[2 * i + 1] = (float)(f->fog_table[i] & 0xff);
+        }
+        SDL_PushGPUFragmentUniformData(cmd, 1, &fog, sizeof fog);
         SDL_GPUBufferBinding vb = { vbuf, 0 }, ib = { ibuf, 0 };
         SDL_BindGPUVertexBuffers(rp, 0, &vb, 1);
         SDL_BindGPUIndexBuffer(rp, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
@@ -620,7 +663,7 @@ void gpu_render(const pvr_frame *f)
         SDL_GPUSampler *bound_smp = NULL;
         strip_uniforms last = { { -1, -1, -1, -1 }, { -1, 0, 0, 0 } };
         int ref = -1, volumes_done = !has_mv;
-        SDL_GPUTextureSamplerBinding plain = { white, samplers[0][0][0] };
+        SDL_GPUTextureSamplerBinding plain = { white, sampler_for(0, 0, 4, 0, 0) };
         SDL_BindGPUFragmentSamplers(rp, 0, &plain, 1);
         for (int d = 0; d <= nd; d++) {
             // the opaque and punch-through lists are down: the volumes go on them
@@ -647,10 +690,12 @@ void gpu_render(const pvr_frame *f)
             int r = s->list != 2 && (s->pcw & PVR_PCW_SHADOW) ? 0x80 : 0;
             if (r != ref) { SDL_SetGPUStencilReference(rp, (Uint8)r); ref = r; }
 
-            int filter = textured && ((tsp >> 13) & 3) != 0;
+            int filter = textured ? (int)((tsp >> 13) & 3) : 0;
+            if (filter > 2) filter = 2;   // both trilinear passes: one trilinear lookup
+            int mipped = textured && pvr_texture_levels(tsp, s->tcw) > 1;
             int um = (tsp >> 16) & 1 ? 2 : (tsp >> 18) & 1 ? 1 : 0;
             int vm = (tsp >> 15) & 1 ? 2 : (tsp >> 17) & 1 ? 1 : 0;
-            SDL_GPUSampler *smp = samplers[filter][um][vm];
+            SDL_GPUSampler *smp = sampler_for(filter, mipped, (int)((tsp >> 8) & 15), um, vm);
             if (draws[d].tex != bound_tex || smp != bound_smp) {
                 SDL_GPUTextureSamplerBinding tb = { draws[d].tex, smp };
                 SDL_BindGPUFragmentSamplers(rp, 0, &tb, 1);
@@ -658,9 +703,9 @@ void gpu_render(const pvr_frame *f)
                 bound_smp = smp;
             }
 
-            strip_uniforms u = { { 0, (int32_t)((tsp >> 6) & 3), 0, 0 }, { f->pt_ref, 0, 0, 0 } };
+            strip_uniforms u = { { 0, (int32_t)((tsp >> 6) & 3), (int32_t)((tsp >> 22) & 3), 0 }, { f->pt_ref, 0, 0, 0 } };
             u.mode[0] = textured | ((isp >> 23) & 1) << 1 | ((isp >> 24) & 1) << 2 | ((tsp >> 20) & 1) << 3 |
-                        ((tsp >> 19) & 1) << 4 | (s->list == 4) << 5;
+                        ((tsp >> 19) & 1) << 4 | (s->list == 4) << 5 | ((tsp >> 21) & 1) << 6;
             if (memcmp(&u, &last, sizeof u)) {
                 SDL_PushGPUFragmentUniformData(cmd, 0, &u, sizeof u);
                 last = u;

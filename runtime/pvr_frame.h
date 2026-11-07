@@ -53,6 +53,10 @@ typedef struct {
     const pvr_modvol *m;
     int nm;
     int autosort;             // ISP_FEED_CFG bit 0 clear: translucent pixels sorted by depth
+    // fog and colour clamp registers, as they were
+    float fog_density;
+    uint32_t fog_col_ram, fog_col_vert, clamp_max, clamp_min;   // ARGB8888
+    uint16_t fog_table[128];  // high byte: the value at an entry's start, low byte: at its end
     int shadow_on;            // FPU_SHAD_SCALE bit 8: inside a volume, colour is scaled
     float shadow;             // by this (else: the polygon's second volume, not drawn yet)
 } pvr_frame;
@@ -62,6 +66,10 @@ typedef struct {
 void pvr_texture_size(uint32_t tsp, int *w, int *h);
 uint64_t pvr_texture_hash(uint32_t tsp, uint32_t tcw);       /* texels (and palette) it reads */
 void pvr_texture_decode(uint32_t tsp, uint32_t tcw, uint32_t *argb);   /* w * h ARGB8888 */
+/* Mipmapped textures (TCW bit 31) carry every level, 1x1 up: how many, and
+ * level l (2^l x 2^l) decoded. Others have just one. */
+int pvr_texture_levels(uint32_t tsp, uint32_t tcw);
+void pvr_texture_decode_level(uint32_t tsp, uint32_t tcw, int l, uint32_t *argb);
 
 /* video.c: the display is showing the framebuffer at this address. A render
  * to an address that has been on screen can stay on the GPU; one that hasn't

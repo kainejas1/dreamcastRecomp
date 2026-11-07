@@ -39,7 +39,8 @@ stays on your machine (`extracted/` and `out/` are ignored by git).
 - GPU renderer (Vulkan): any multiple of 640x480, 4K included
 - modifier volumes: shadows under characters and cars, in both renderers
 - translucency sorted by depth, as the PVR does (lens flares, Story Select's cards)
-- next: fog, mipmaps, the GPU's share of translucent modifier volumes
+- fog (table and per-vertex) in both renderers; the game's own mip levels on the GPU
+- next: the GPU's share of translucent modifier volumes, two-volume polygons
 
 ## Build
 
@@ -159,9 +160,19 @@ of under 1 in 255 on Story Select). Both also follow the hardware's fixed depth
 rules: punch-through and sorted translucent polygons test "greater or equal",
 punch-through always writes depth, sorted translucent never does.
 
-Not drawn yet: fog, the second colours of two-volume polygons, mipmaps, and on
-the GPU the translucent list's modifier volumes and per-pixel sorting. Per-tile
-pre-sort flags in the region array are ignored (only `ISP_FEED_CFG` decides).
+Fog follows Flycast's shader: table fog looks up density x 1/w in the 128-entry
+`FOG_TABLE` (as a float with a 4-bit mantissa, blending each entry's two values),
+per-vertex fog uses the offset colour's alpha, and the colour clamp
+(`FOG_CLAMP_MIN/MAX`) comes before it. City Escape hazes to white with it; both
+renderers shift its fogged pixels by the same amount (about 6 levels on average).
+Mipmapped textures get every level the game stored, decoded from VRAM, and
+trilinear filtering where the polygon asks for it; the software renderer still
+reads the top level only.
+
+Not drawn yet: the second colours of two-volume polygons, mip levels in the
+software renderer, and on the GPU the translucent list's modifier volumes and
+per-pixel sorting. Per-tile pre-sort flags in the region array are ignored (only
+`ISP_FEED_CFG` decides).
 
 ## Speed
 

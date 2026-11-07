@@ -17,6 +17,8 @@ layout(location = 2) out vec4 v_off;
 // vertex first in each triangle, where the GPU takes flat values from
 layout(location = 3) flat out vec4 f_col;
 layout(location = 4) flat out vec4 f_off;
+// 1/w, linear on screen as the PVR's own: fog reads it
+layout(location = 5) noperspective out float v_z;
 
 void main()
 {
@@ -32,4 +34,5 @@ void main()
     v_off = off;
     f_col = col;
     f_off = off;
+    v_z = pos.z;
 }

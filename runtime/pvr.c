@@ -519,13 +519,15 @@ typedef struct {
     int clamp_u, clamp_v, flip_u, flip_v;
 } sampler;
 
-static void sampler_init(sampler *t, uint32_t tsp, uint32_t tcw)
+// level: for a mipmapped texture, the level 2^level square to read (-1: the top one)
+static void sampler_level(sampler *t, uint32_t tsp, uint32_t tcw, int level)
 {
     uint32_t addr = (tcw & 0x1fffffu) << 3;
     int fmt = (tcw >> 27) & 7, vq = (tcw >> 30) & 1, mip = (tcw >> 31) & 1;
     t->fmt = fmt;
     t->w = 8 << ((tsp >> 3) & 7);
     t->h = 8 << (tsp & 7);
+    if (mip && level >= 0) t->w = t->h = 1 << level;
     t->clamp_u = (tsp >> 16) & 1;
     t->clamp_v = (tsp >> 15) & 1;
     t->flip_u = (tsp >> 18) & 1;
@@ -543,7 +545,7 @@ static void sampler_init(sampler *t, uint32_t tsp, uint32_t tcw)
         t->kind = TEX_VQ;
         t->book = addr;
         t->base = addr + 2048 + (mip ? vq_mip[lw] : 0);
-        t->m -= 1;   // the index map is (w/2) x (h/2)
+        if (t->m > 0) t->m -= 1;   // the index map is (w/2) x (h/2); the 1x1 level is a 2x2 block's corner
         return;
     }
     if (fmt == 5) {   // 4 bpp palette
@@ -563,6 +565,8 @@ static void sampler_init(sampler *t, uint32_t tsp, uint32_t tcw)
     t->base = addr + (mip ? other_mip[lw] * 2 : 0);
     t->kind = fmt == 3 ? TEX_YUV : fmt == 4 ? TEX_BUMP : TEX_16;
 }
+
+static void sampler_init(sampler *t, uint32_t tsp, uint32_t tcw) { sampler_level(t, tsp, tcw, -1); }
 
 // ARGB8888 of texel (x, y), already wrapped to the texture
 static uint32_t sample(const sampler *t, uint32_t x, uint32_t y)
@@ -614,24 +618,37 @@ uint64_t pvr_texture_hash(uint32_t tsp, uint32_t tcw)
 {
     sampler t;
     sampler_init(&t, tsp, tcw);
-    uint32_t w = (uint32_t)t.w, h = (uint32_t)t.h;
+    uint32_t w = (uint32_t)t.w, h = (uint32_t)t.h, addr = (tcw & 0x1fffffu) << 3, top;
     uint64_t r = 0xcbf29ce484222325ull ^ (uint64_t)t.kind << 40 ^ (uint64_t)t.stride << 48;
-    switch (t.kind) {
-    case TEX_VQ:
-        r = hash_words(r, t.book, 2048);
-        return hash_words(r, t.base, w / 2 * h / 2);
-    case TEX_PAL4:
-    case TEX_PAL8: {
-        uint32_t n = t.kind == TEX_PAL4 ? 16 : 256;
-        r = hash_words(r, t.base, t.kind == TEX_PAL4 ? w * h / 2 : w * h);
-        for (uint32_t i = 0; i < n; i++) r = (r ^ pal_argb[(t.pal + i) & 1023]) * 0x100000001b3ull;
-        return r;
+    switch (t.kind) {   // bytes of the top level; smaller mip levels (and a VQ codebook) come before it
+    case TEX_VQ: top = w / 2 * h / 2; break;
+    case TEX_PAL4: top = w * h / 2; break;
+    case TEX_PAL8: top = w * h; break;
+    case TEX_BUMP: return r;
+    default: top = (t.twiddled ? w : (uint32_t)t.stride) * h * 2; break;
     }
-    case TEX_BUMP:
-        return r;
-    default:
-        return hash_words(r, t.base, (t.twiddled ? w : (uint32_t)t.stride) * h * 2);
-    }
+    r = hash_words(r, addr, t.base + top - addr);
+    if (t.kind == TEX_PAL4 || t.kind == TEX_PAL8)
+        for (uint32_t i = 0, n = t.kind == TEX_PAL4 ? 16 : 256; i < n; i++)
+            r = (r ^ pal_argb[(t.pal + i) & 1023]) * 0x100000001b3ull;
+    return r;
+}
+
+int pvr_texture_levels(uint32_t tsp, uint32_t tcw)
+{
+    int w, h;
+    pvr_texture_size(tsp, &w, &h);
+    if (!((tcw >> 31) & 1) || w != h) return 1;
+    return log2i((uint32_t)w) + 1;
+}
+
+void pvr_texture_decode_level(uint32_t tsp, uint32_t tcw, int l, uint32_t *argb)
+{
+    sampler t;
+    sampler_level(&t, tsp, tcw, l);
+    for (int y = 0; y < t.h; y++)
+        for (int x = 0; x < t.w; x++)
+            argb[y * t.w + x] = sample(&t, (uint32_t)x, (uint32_t)y);
 }
 
 void pvr_texture_decode(uint32_t tsp, uint32_t tcw, uint32_t *argb)
@@ -728,7 +745,33 @@ static struct {
     int shadow_on;
     float shadow;
     int autosort;             // ISP_FEED_CFG bit 0 clear
+    // fog (FOG_* registers) and the colour clamp
+    float fog_density, fog_ram[3], fog_vert[3], clamp_min[4], clamp_max[4];
+    uint8_t fog_hi[128], fog_lo[128];
 } job;
+
+// Table fog (Flycast's fog_mode2): density x 1/w, as a float with a 4-bit
+// mantissa, picks one of 128 entries; the fraction blends its two values
+static float fog_coef(float z)
+{
+    float v = job.fog_density * z;
+    if (!(v >= 1.0f)) v = 1.0f;   // also NaN
+    if (v > 255.9999f) v = 255.9999f;
+    float e = floorf(log2f(v));
+    float m = v * 16.0f / exp2f(e) - 16.0f;
+    int idx = (int)floorf(m) + (int)e * 16;
+    idx = idx < 0 ? 0 : idx > 127 ? 127 : idx;
+    float f = m - floorf(m);
+    return ((float)job.fog_hi[idx] * (1.0f - f) + (float)job.fog_lo[idx] * f) / 255.0f;
+}
+
+static void argb_to_float(uint32_t c, float *out)
+{
+    out[0] = ((c >> 16) & 0xff) / 255.0f;
+    out[1] = ((c >> 8) & 0xff) / 255.0f;
+    out[2] = (c & 0xff) / 255.0f;
+    out[3] = (c >> 24) / 255.0f;
+}
 
 static int band_of(int t, int y) { return ((y >> BAND_SHIFT) % nthreads) == t; }
 
@@ -765,6 +808,7 @@ static float clamp01(float f) { return f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
 // what a strip's ISP/TSP words say, decoded once per strip
 typedef struct {
     int list, textured, offset, gouraud, zmode, zwrite;
+    int fog, clamp;           // TSP: fog control (0 table, 1 vertex, 2 none, 3 table mode 2), colour clamp
     int use_alpha, ignore_tex_alpha, shade, src_f, dst_f;
     uint8_t shadow;           // 0x80 if modifier volumes act on it
     sampler tex;
@@ -790,6 +834,8 @@ static void strip_mode_init(strip_mode *m, const strip *s)
     m->src_f = (int)(tsp >> 29);
     m->dst_f = (int)((tsp >> 26) & 7);
     m->shadow = s->pcw & PVR_PCW_SHADOW ? 0x80 : 0;
+    m->fog = (int)((tsp >> 22) & 3);
+    m->clamp = (int)((tsp >> 21) & 1);
     if (m->textured) sampler_init(&m->tex, tsp, s->tcw);
 }
 
@@ -875,6 +921,10 @@ static void triangle(int t, const strip_mode *m, const vtx *a, const vtx *b, con
                 off[k] = m->gouraud ? q0 * a->off[k] + q1 * b->off[k] + q2 * c->off[k] : c->off[k];
             }
             if (!m->use_alpha) col[3] = 1.0f;
+            if (m->fog == 3) {   // fog look-up mode 2: the fog colour, the table as alpha
+                for (int k = 0; k < 3; k++) col[k] = job.fog_ram[k];
+                col[3] = fog_coef(z);
+            }
 
             float out[4] = { col[0], col[1], col[2], col[3] };
             if (m->textured) {
@@ -899,11 +949,24 @@ static void triangle(int t, const strip_mode *m, const vtx *a, const vtx *b, con
                     for (int k = 0; k < 4; k++) out[k] = tc[k] * col[k];
                     break;
                 }
+                if (m->offset)   // offset colour goes on textured polygons only
+                    for (int k = 0; k < 3; k++) out[k] += off[k];
             }
-            if (m->offset)
-                for (int k = 0; k < 3; k++) out[k] += off[k];
+            if (m->clamp)
+                for (int k = 0; k < 4; k++)
+                    out[k] = out[k] < job.clamp_min[k] ? job.clamp_min[k] : out[k] > job.clamp_max[k] ? job.clamp_max[k] : out[k];
+            if (m->fog == 0) {   // table fog
+                float f = fog_coef(z);
+                for (int k = 0; k < 3; k++) out[k] = out[k] * (1.0f - f) + job.fog_ram[k] * f;
+            } else if (m->fog == 1 && m->offset) {   // per-vertex fog: the offset colour's alpha
+                for (int k = 0; k < 3; k++) out[k] = out[k] * (1.0f - off[3]) + job.fog_vert[k] * off[3];
+            }
 
-            if (m->list == 4 && out[3] < pt_ref) continue;   // punch-through: alpha test
+            if (m->list == 4) {   // punch-through: alpha test on 8-bit alpha, then opaque
+                float a8 = roundf(out[3] * 255.0f) / 255.0f;
+                if (pt_ref > a8) continue;
+                out[3] = 1.0f;
+            }
             if (m->list == 2 && job.autosort) {   // sorted: blended later, with the pixel's others
                 if (pool[t].n == pool[t].cap) {
                     pool[t].cap = pool[t].cap ? pool[t].cap * 2 : 65536;
@@ -1200,6 +1263,11 @@ static void dump_render(const ta_ctx *c)
     FILE *f = fopen("pvr_dump.txt", "w");
     if (!f) return;
     fprintf(f, "fpu_shad_scale %08x\n", holly_reg(PVR_FPU_SHAD_SCALE));
+    fprintf(f, "fog col_ram %08x col_vert %08x density %08x clamp_max %08x clamp_min %08x\n", holly_reg(PVR_FOG_COL_RAM),
+            holly_reg(PVR_FOG_COL_VERT), holly_reg(PVR_FOG_DENSITY), holly_reg(PVR_FOG_CLAMP_MAX), holly_reg(PVR_FOG_CLAMP_MIN));
+    fprintf(f, "fog table");
+    for (uint32_t i = 0; i < 128; i++) fprintf(f, " %04x", holly_reg(PVR_FOG_TABLE + 4 * i) & 0xffff);
+    fprintf(f, "\n");
     fprintf(f, "isp_feed_cfg %08x fpu_param_cfg %08x region_base %08x\n", holly_reg(PVR_ISP_FEED_CFG),
             holly_reg(PVR_FPU_PARAM_CFG), holly_reg(PVR_REGION_BASE));
     for (int i = 0; i < 12; i++) fprintf(f, "region word %d: %08x\n", i, v64_r32(holly_reg(PVR_REGION_BASE) + 4u * (uint32_t)i));
@@ -1221,6 +1289,24 @@ static void dump_render(const ta_ctx *c)
         }
     }
     fclose(f);
+}
+
+// the fog registers into job, and the scale the density stands for
+static void load_fog(void)
+{
+    uint32_t d = holly_reg(PVR_FOG_DENSITY);
+    job.fog_density = (float)((d >> 8) & 0xff) / 128.0f * ldexpf(1.0f, (int8_t)(d & 0xff));
+    float ram[4], vert[4];
+    argb_to_float(holly_reg(PVR_FOG_COL_RAM), ram);
+    argb_to_float(holly_reg(PVR_FOG_COL_VERT), vert);
+    for (int k = 0; k < 3; k++) { job.fog_ram[k] = ram[k]; job.fog_vert[k] = vert[k]; }
+    argb_to_float(holly_reg(PVR_FOG_CLAMP_MIN), job.clamp_min);
+    argb_to_float(holly_reg(PVR_FOG_CLAMP_MAX), job.clamp_max);
+    for (uint32_t i = 0; i < 128; i++) {
+        uint32_t e = holly_reg(PVR_FOG_TABLE + 4 * i);
+        job.fog_hi[i] = (uint8_t)(e >> 8);
+        job.fog_lo[i] = (uint8_t)e;
+    }
 }
 
 static void render(void)
@@ -1257,6 +1343,7 @@ static void render(void)
     if ((long)renders == pvrdump) dump_render(c);
 
     load_palette();
+    load_fog();
     pt_ref = (float)(holly_reg(PVR_PT_ALPHA_REF) & 0xff) / 255.0f;
     uint32_t ctrl = holly_reg(PVR_FB_W_CTRL);
     job.c = c;
@@ -1275,9 +1362,13 @@ static void render(void)
             .bg = job.bg, .bgz = job.bgz, .pt_ref = pt_ref, .fb = fbw, .hscale = hscale,
             .mv = c->mv, .nmv = c->nmv, .m = c->m, .nm = c->nm,
             .autosort = !(holly_reg(PVR_ISP_FEED_CFG) & 1),
+            .fog_density = job.fog_density,
+            .fog_col_ram = holly_reg(PVR_FOG_COL_RAM), .fog_col_vert = holly_reg(PVR_FOG_COL_VERT),
+            .clamp_max = holly_reg(PVR_FOG_CLAMP_MAX), .clamp_min = holly_reg(PVR_FOG_CLAMP_MIN),
             .shadow_on = (holly_reg(PVR_FPU_SHAD_SCALE) >> 8) & 1,
             .shadow = (float)(holly_reg(PVR_FPU_SHAD_SCALE) & 0xff) / 256.0f,
         };
+        for (uint32_t i = 0; i < 128; i++) f.fog_table[i] = (uint16_t)holly_reg(PVR_FOG_TABLE + 4 * i);
         gpu_render(&f);
         on_gpu = 1;
     }
