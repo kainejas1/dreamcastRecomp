@@ -2,6 +2,8 @@
 #include "memory.h"
 
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHANNELS       64
@@ -47,6 +49,9 @@ typedef struct {
 
 static channel ch[CHANNELS];
 static uint32_t *regs;
+static uint64_t samples;   // made so far, for the log's timestamps
+static long chanlog;       // DC_AICACHLOG=n: log the first n channel events
+static void log_event(unsigned n, const char *what);
 static uint16_t gain_table[GAIN_SIZE];
 
 static const int adpcm_scale[8] = {
@@ -121,6 +126,21 @@ static unsigned attenuation(unsigned level)
         return 0;
 
     return gain_table[level];
+}
+
+/*
+ * The channel stops making sound and is keyed off, as Flycast does it: the
+ * envelope goes to release at silence and KYONB is cleared in the register,
+ * so a later KYONEX (the driver writes one for any channel's change) doesn't
+ * start it again until the driver sets KYONB once more.
+ */
+static void stop(unsigned n, channel *c, const char *why)
+{
+    c->playing = 0;
+    c->phase = ENV_RELEASE;
+    c->level = ENV_MAX;
+    regs[n * CH_WORDS + C_SA] &= ~0x4000u;
+    log_event(n, why);
 }
 
 /* Reset the ADPCM decoder to its initial predictor state. */
@@ -379,12 +399,10 @@ static void envelope_tick(unsigned n, channel *c)
 
             c->level += (c->level >> shift) + 1;
 
-            if (c->level >= ENV_MAX) {
-                c->level = ENV_MAX;
-                c->playing = 0;
-            }
+            if (c->level >= ENV_MAX)
+                stop(n, c, "faded");
         } else {
-            c->playing = 0;
+            stop(n, c, "faded");
         }
         break;
     }
@@ -438,9 +456,21 @@ static uint32_t pitch_step(unsigned n)
     return step;
 }
 
+static void log_event(unsigned n, const char *what)
+{
+    if (chanlog <= 0) return;
+    chanlog--;
+    fprintf(stderr, "[aica] %8.3fs ch %2u %-8s sa %05x fmt %u loop %u lsa %04x lea %04x pitch %04x eg %04x eg2 %04x "
+            "tl %02x send %04x | level %03x phase %d pos %04x\n", (double)samples / 44100.0, n, what,
+            ((cr(n, C_SA) & 0x7fu) << 16) | cr(n, C_SA_LO), (cr(n, C_SA) >> 7) & 3u, (cr(n, C_SA) >> 9) & 1u,
+            cr(n, C_LSA), cr(n, C_LEA), cr(n, C_PITCH), cr(n, C_EG), cr(n, C_EG2), (cr(n, C_TL) >> 8) & 0xffu,
+            cr(n, C_SEND), ch[n].level, ch[n].phase, ch[n].pos);
+}
+
 void aica_chan_init(uint32_t *r)
 {
     regs = r;
+    chanlog = getenv("DC_AICACHLOG") ? atol(getenv("DC_AICACHLOG")) : 0;
 
     memset(ch, 0, sizeof ch);
 
@@ -467,8 +497,10 @@ void aica_chan_init(uint32_t *r)
 }
 
 /*
- * KYONEX triggers processing of all channels' KYONB bits.
- * KYONEX itself is a write trigger and is not stored as channel state.
+ * KYONEX applies every channel's KYONB: set keys on a channel that is keyed
+ * off (stopped, or still fading out in release), clear keys off one that is
+ * on. A channel already in that state is left alone. KYONEX itself is a write
+ * trigger and is not stored as channel state.
  */
 void aica_chan_keyon(void)
 {
@@ -478,7 +510,8 @@ void aica_chan_keyon(void)
         uint32_t control = cr(n, C_SA);
         int keyon = (control & 0x4000u) != 0;
 
-        if (keyon && !c->playing) {
+        if (keyon && c->phase == ENV_RELEASE) {
+            log_event(n, c->playing ? "on-again" : "on");
             c->playing = 1;
             c->pos = 0;
             c->frac = 0;
@@ -490,8 +523,8 @@ void aica_chan_keyon(void)
             c->looped = 0;
 
             reset_adpcm(c);
-        } else if (!keyon && c->playing &&
-                   c->phase != ENV_RELEASE) {
+        } else if (!keyon && c->phase != ENV_RELEASE) {
+            log_event(n, "off");
             c->phase = ENV_RELEASE;
             c->env_counter = 0;
         }
@@ -503,6 +536,7 @@ void aica_chan_sample(int16_t out[2])
 {
     int64_t left = 0;
     int64_t right = 0;
+    samples++;
 
     for (unsigned n = 0; n < CHANNELS; ++n) {
         channel *c = &ch[n];
@@ -515,7 +549,7 @@ void aica_chan_sample(int16_t out[2])
         uint32_t lea = cr(n, C_LEA);
 
         if (lea == 0) {
-            c->playing = 0;
+            stop(n, c, "no-end");
             continue;
         }
 
@@ -579,10 +613,19 @@ void aica_chan_sample(int16_t out[2])
                     if (((control >> 7) & 3u) >= 2u)
                         adpcm_loop(c, lsa);
                 } else {
-                    c->playing = 0;
+                    c->looped = 1;
+                    c->pos = 0;
+                    c->frac = 0;
+                    stop(n, c, "ended");
+                    continue;
                 }
             } else {
-                c->playing = 0;
+                /* A one-shot reached its end: LP is set and the channel stops. */
+                c->looped = 1;
+                c->pos = 0;
+                c->frac = 0;
+                stop(n, c, "ended");
+                continue;
             }
         }
 
@@ -606,18 +649,22 @@ void aica_chan_sample(int16_t out[2])
     out[1] = (int16_t)clamp16((int)right);
 }
 
-/* Return LP, envelope phase and attenuation for the selected channel. */
-uint32_t aica_chan_info(void)
+/*
+ * LP, envelope state (SGC) and level (EG) of the channel selected by MSLC.
+ * EG reads 0x1fff once the level is past 0x3bf, and reading LP clears it
+ * (Flycast: any read but a byte read of 0x2810).
+ */
+uint32_t aica_chan_info(int clear_lp)
 {
     unsigned n = (regs[0x280c / 4] >> 8) & 0x3fu;
     channel *c = &ch[n];
+    uint32_t eg = c->level > 0x3bf ? 0x1fffu : (uint32_t)c->level;
+    uint32_t v = ((uint32_t)(c->looped != 0) << 15) |
+                 ((uint32_t)(c->phase & 3) << 13) | eg;
 
-    if (!c->playing && c->level >= ENV_MAX)
-        return 0x7fff;
-
-    return ((uint32_t)(c->looped != 0) << 15) |
-           ((uint32_t)(c->phase & 3) << 13) |
-           ((uint32_t)c->level & 0x1fffu);
+    if (clear_lp)
+        c->looped = 0;
+    return v;
 }
 
 /* Return the selected channel's current whole-sample position. */

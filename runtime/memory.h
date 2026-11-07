@@ -18,6 +18,9 @@ extern uint8_t dc_vram[DC_VRAM_SIZE];
 #define DC_ARAM_SIZE (2u * 1024u * 1024u)
 extern uint8_t dc_aram[DC_ARAM_SIZE];
 
+/* In main.c: an access hit unimplemented hardware (DC_HWSTOP can stop there). */
+void dc_hw_miss(uint32_t address);
+
 /* Address of the most recent access that hit unimplemented hardware. */
 extern uint32_t mem_last_unmapped;
 

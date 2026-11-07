@@ -30,6 +30,11 @@
 #define PVR_FB_W_SOF1      0x005f8060u
 #define PVR_FB_X_CLIP      0x005f8068u
 #define PVR_FB_Y_CLIP      0x005f806cu
+#define PVR_FPU_SHAD_SCALE 0x005f8074u   /* bit 8: intensity shadows; 7-0: their scale / 256 */
+#define PVR_FPU_PARAM_CFG  0x005f807cu   /* bit 21: region array entries are 6 words (type 2) */
+#define PVR_ISP_FEED_CFG   0x005f8098u   /* bit 0: translucent list in pre-sort (sent) order, else sorted */
+#define PVR_FPU_PARAM_CFG  0x005f807cu   /* bit 21: region array entries are 6 words (type 2) */
+#define PVR_ISP_FEED_CFG   0x005f8098u   /* bit 0: translucent list in pre-sort (sent) order, else sorted */
 #define PVR_ISP_BACKGND_D  0x005f8088u
 #define PVR_ISP_BACKGND_T  0x005f808cu
 #define PVR_SPG_CONTROL    0x005f80d0u

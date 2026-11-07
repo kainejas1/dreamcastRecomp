@@ -198,6 +198,7 @@ static void log_unmapped(const char *op, uint32_t address,
         return;
 
     mem_last_unmapped = address;
+    dc_hw_miss(address);
     if (logged >= 500)
         return;
     if (++logged == 500) {

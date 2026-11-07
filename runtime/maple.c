@@ -1,4 +1,5 @@
 #include "maple.h"
+#include "clock.h"
 #include "holly.h"
 #include "memory.h"
 #include "video.h"
@@ -142,8 +143,8 @@ static int answer(const uint32_t *in, int nin, uint32_t *out)
             n = 3;
             code = R_DATA_TRANSFER;
         } else if (dev == VMU && fn == FN_CLOCK) {
-            time_t t = time(NULL);
-            struct tm *tm = localtime(&t);
+            time_t t = (time_t)clock_unix_seconds();
+            struct tm *tm = clock_is_virtual() ? gmtime(&t) : localtime(&t);   // no time zones in a replay
             uint8_t b[8];
             put16(b, (uint16_t)(tm->tm_year + 1900));
             b[2] = (uint8_t)(tm->tm_mon + 1);

@@ -39,6 +39,9 @@ typedef struct {
 extern const dc_module dc_modules[];
 extern const int dc_module_count;
 
+/* The game's setjmp and longjmp (dcrecomp emit --setjmp/--longjmp), 0 if none. */
+extern const uint32_t dc_setjmp_addr, dc_longjmp_addr;
+
 /* ---- memory (virtual addresses; the runtime handles mirrors and MMIO) ---- */
 
 uint8_t  mem_r8(uint32_t addr);
@@ -57,13 +60,17 @@ void     mem_w64(uint32_t addr, uint64_t v);
 sh4_func dc_lookup(uint32_t addr);
 
 /* Call through a computed address (jsr @Rn, bsrf, unknown table targets).
- * The caller has already set ctx->pr. Must not return quietly if addr is
- * unknown: report it, because that is a function the analysis missed. */
+ * The caller has already set ctx->pr. If addr is unknown the analysis missed
+ * it: the runtime notes that and runs it in the interpreter. */
 void dc_call(sh4_ctx *ctx, uint32_t addr);
 
 /* Same for a computed tail jump (jmp @Rn, braf); the generated code returns
  * right after it. */
 void dc_jump(sh4_ctx *ctx, uint32_t addr);
+
+/* dc_jump for the interpreter: does nothing and returns 0 if addr is unknown,
+ * so the interpreter can carry on from there itself. */
+int dc_try_jump(sh4_ctx *ctx, uint32_t addr);
 
 /* An instruction the emitter has no translation for. */
 void dc_unhandled(sh4_ctx *ctx, uint32_t pc, uint16_t raw);

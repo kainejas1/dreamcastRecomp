@@ -34,4 +34,7 @@ int dc_emit_module(const dc_analysis *a, const dc_analysis *main, const dc_emit_
 /* modules.c: the runtime's table of modules (written even with n == 0). */
 int dc_emit_registry(const dc_emit_options *opt, const dc_module_info *mods, int n);
 
+/* dir/interp_ops.c: the interpreter's table of instructions. Needs no game. */
+int dc_emit_interp(const char *dir);
+
 #endif

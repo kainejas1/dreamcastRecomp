@@ -51,6 +51,8 @@ uint64_t holly_clock_us(void);
 /* Raw register value, no side effects (for the PowerVR code). */
 uint32_t holly_reg(uint32_t address);
 void holly_set_reg(uint32_t address, uint32_t value);
+/* The same for a plain SH-4 register (not the timers), not logged. */
+uint32_t sh4_reg(uint32_t address);
 /* Set bits in SB_ISTNRM (an interrupt happened: list done, DMA end, ...). */
 void holly_raise(uint32_t bits);
 

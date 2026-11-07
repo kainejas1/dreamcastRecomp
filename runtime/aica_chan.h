@@ -12,7 +12,7 @@ void aica_chan_keyon(void);
 void aica_chan_sample(int16_t out[2]);
 
 /* Read status and position for the channel selected by MSLC. */
-uint32_t aica_chan_info(void);
+uint32_t aica_chan_info(int clear_lp);   /* reading LP clears it, unless clear_lp is 0 */
 uint32_t aica_chan_pos(void);
 
 #endif

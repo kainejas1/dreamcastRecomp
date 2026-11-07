@@ -55,7 +55,7 @@ int dc_literal_written(const dc_analysis *a, uint32_t addr);
 
 /* The constant held in `reg` just before the instruction at pc, if it can be
  * found by walking back through straight-line code. Returns 1 if found. */
-int dc_resolve_reg(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t *value);
+int dc_resolve_reg(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t *value, uint32_t *from);
 
 /* Targets of the jump-table jmp/braf at pc, inside the function starting at
  * func_start. Fills up to `max` targets and returns how many (0 if pc is not

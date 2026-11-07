@@ -2,6 +2,12 @@
 #include "holly.h"
 #include "memory.h"
 #include "pvr.h"
+#include "pvr_frame.h"
+#include "clock.h"
+#ifdef DC_GPU
+#include "gpu.h"
+#endif
+#include "prof.h"
 
 #include <SDL3/SDL.h>
 #define SDL_MAIN_HANDLED   // main() is ours, SDL just has to be told
@@ -12,7 +18,8 @@
 #include <string.h>
 
 static SDL_Window *window;
-static SDL_Renderer *renderer;
+static SDL_Renderer *renderer;   // NULL when the GPU renderer has the window
+static int on_gpu;               // the GPU renderer shows the frames
 static SDL_Texture *texture;
 static int tex_w, tex_h;
 static uint32_t last_frame = ~0u;
@@ -105,7 +112,7 @@ void video_pad(dc_pad *pad)
     for (int i = 0; i < npresses; i++)   // held for 8 frames
         if (frame >= presses[i].frame && frame < presses[i].frame + 8) pad->buttons |= presses[i].button;
 
-    if (!renderer) return;
+    if (!window) return;
     const bool *k = SDL_GetKeyboardState(NULL);
     if (k[SDL_SCANCODE_UP]) pad->buttons |= PAD_UP;
     if (k[SDL_SCANCODE_DOWN]) pad->buttons |= PAD_DOWN;
@@ -141,6 +148,7 @@ void video_pad(dc_pad *pad)
 // ---- audio ----
 
 static SDL_AudioStream *audio;
+#define AUDIO_LEAD (44100 / 20)   // samples of silence put back in front after running dry: 50 ms
 static FILE *wav;
 static uint32_t wav_bytes;
 
@@ -166,15 +174,35 @@ void video_audio(const short *stereo, int frames)
     }
     if (wav) { fwrite(stereo, 4, (size_t)frames, wav); wav_bytes += (uint32_t)frames * 4; }
 
-    // more than a quarter second waiting (we ran ahead): drop it rather than lag behind
-    if (audio && SDL_GetAudioStreamQueued(audio) < 44100)
+    if (!audio) return;
+    // Samples are made in step with real time, so nothing is ever waiting
+    // ahead of the speakers, and a slow frame (we render on this thread) runs
+    // them dry. When that happens, put a short lead of silence back in front.
+    // More than a quarter second waiting: drop it rather than lag behind.
+    int queued = SDL_GetAudioStreamQueued(audio);
+    if (queued < 0) return;
+    if (queued == 0) {
+        static const short silence[AUDIO_LEAD * 2];
+        prof_underrun();
+        SDL_PutAudioStreamData(audio, silence, sizeof silence);
+    }
+    if (queued < 44100)
         SDL_PutAudioStreamData(audio, stereo, frames * 4);
 }
 
 void video_init(void)
 {
     parse_presses();
-    if (getenv("DC_NOWINDOW")) return;
+    if (getenv("DC_NOWINDOW")) {
+#ifdef DC_GPU
+        // DC_RENDERER=gpu without a window: draws offscreen, for DC_SHOT
+        if (getenv("DC_RENDERER") && !strcmp(getenv("DC_RENDERER"), "gpu")) {
+            SDL_SetMainReady();
+            if (SDL_Init(SDL_INIT_VIDEO)) gpu_init(NULL);
+        }
+#endif
+        return;
+    }
     SDL_SetMainReady();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         fprintf(stderr, "[video] SDL_Init failed: %s, running without a window\n", SDL_GetError());
@@ -184,11 +212,16 @@ void video_init(void)
     audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
     if (audio) SDL_ResumeAudioStreamDevice(audio);
     else fprintf(stderr, "[video] no audio: %s\n", SDL_GetError());
-    if (!SDL_CreateWindowAndRenderer("dcrecomp", 1280, 960, SDL_WINDOW_RESIZABLE, &window, &renderer)) {
+    window = SDL_CreateWindow("dcrecomp", 1280, 960, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (!window) {
         fprintf(stderr, "[video] no window: %s\n", SDL_GetError());
-        window = NULL;
-        renderer = NULL;
+        return;
     }
+#ifdef DC_GPU
+    on_gpu = gpu_init(window);
+#endif
+    if (!on_gpu && !(renderer = SDL_CreateRenderer(window, NULL)))
+        fprintf(stderr, "[video] no renderer: %s\n", SDL_GetError());
 }
 
 void video_frame(void)
@@ -196,11 +229,16 @@ void video_frame(void)
     uint32_t frame = holly_frame_count();
     if (frame == last_frame) return;
     last_frame = frame;
-    if (!renderer) return;
+    // what the display shows: a render to there can stay on the GPU
+    if (holly_reg(PVR_FB_R_CTRL) & 1) pvr_note_display(holly_reg(PVR_FB_R_SOF1));
+    if (!renderer && !on_gpu) return;
+    uint64_t t0 = clock_host_ns();
 
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) exit(0);
+        if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_F11 && !e.key.repeat)
+            SDL_SetWindowFullscreen(window, !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
         if (e.type == SDL_EVENT_GAMEPAD_ADDED && !gamepad) gamepad = SDL_OpenGamepad(e.gdevice.which);
         if (e.type == SDL_EVENT_GAMEPAD_REMOVED && gamepad && SDL_GetGamepadID(gamepad) == e.gdevice.which) {
             SDL_CloseGamepad(gamepad);
@@ -209,6 +247,15 @@ void video_frame(void)
     }
 
     int w, h;
+#ifdef DC_GPU
+    if (on_gpu) {
+        // the GPU's own picture if it drew this framebuffer, else what's in VRAM
+        if (!gpu_present(holly_reg(PVR_FB_R_SOF1) & 0x00fffffcu) && read_screen(&w, &h))
+            gpu_present_pixels(pixels, w, h);
+        prof_add(PROF_PRESENT, t0);
+        return;
+    }
+#endif
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
     if (read_screen(&w, &h)) {
@@ -225,6 +272,7 @@ void video_frame(void)
         }
     }
     SDL_RenderPresent(renderer);
+    prof_add(PROF_PRESENT, t0);
 }
 
 // ---- PNG, uncompressed (stored deflate blocks), so no zlib needed ----
@@ -316,6 +364,14 @@ void video_shutdown(void)
     }
     const char *path = getenv("DC_SHOT");
     int w, h;
+#ifdef DC_GPU
+    static uint32_t *gpu_pixels;
+    if (path && gpu_active() && gpu_read(holly_reg(PVR_FB_R_SOF1) & 0x00fffffcu, &gpu_pixels, &w, &h)) {
+        if (save_png(path, gpu_pixels, w, h))
+            fprintf(stderr, "  screen (%dx%d from the GPU, %u frames rendered) saved to %s\n", w, h, pvr_render_count(), path);
+        return;
+    }
+#endif
     if (path) {
         if (read_screen(&w, &h) && save_png(path, pixels, w, h))
             fprintf(stderr, "  screen (%dx%d, %u frames rendered) saved to %s\n", w, h, pvr_render_count(), path);

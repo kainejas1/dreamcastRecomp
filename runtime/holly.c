@@ -1,18 +1,13 @@
 #include "holly.h"
+#include "clock.h"
 #include "maple.h"
 #include "memory.h"
 #include "pvr.h"
+#include "tmu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
-#include <time.h>
-#endif
 
 #define HOLLY_WORDS ((HOLLY_REG_END - HOLLY_REG_BASE) / 4u)
 #define SH4REG_BASE 0xff000000u
@@ -23,49 +18,21 @@
 
 static uint32_t holly_regs[HOLLY_WORDS];
 static uint32_t sh4_regs[SH4REG_WORDS];
-static uint64_t host_frequency;
-static uint64_t start_ticks;
 static uint32_t configured_vcount = 524u;
 static uint32_t last_scanline;
 static uint32_t pending_status;
 static uint32_t frame_count;   // vblank-ins seen
-static int clock_ready;
 
 uint32_t holly_frame_count(void) { return frame_count; }
 
 uint32_t holly_reg(uint32_t address) { return holly_regs[(address - HOLLY_REG_BASE) / 4u]; }
+uint32_t sh4_reg(uint32_t address) { return sh4_regs[(address - SH4REG_BASE) / 4u]; }
 void holly_set_reg(uint32_t address, uint32_t value) { holly_regs[(address - HOLLY_REG_BASE) / 4u] = value; }
 void holly_raise(uint32_t bits) { holly_regs[(HOLLY_SB_ISTNRM - HOLLY_REG_BASE) / 4u] |= bits; }
 
 // DC_HOLLYLOG=1: log register accesses (not SPG_STATUS polling), first 3000
 static int reglog;
 #define REGLOG(...) do { if (reglog > 0) { reglog--; fprintf(stderr, __VA_ARGS__); } } while (0)
-
-static uint64_t host_ticks(void)
-{
-#ifdef _WIN32
-    LARGE_INTEGER now;
-    if (!QueryPerformanceCounter(&now)) return 0;
-    return (uint64_t)now.QuadPart;
-#else
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) !=0 ) return 0;
-    return (uint64_t)ts.tv_sec * 1000000000ull
-        +  (uint64_t)ts.tv_nsec;
-#endif
-}
-
-static uint64_t ticks_per_second(void)
-{
-#ifdef _WIN32
-    LARGE_INTEGER f;
-    if (!QueryPerformanceFrequency(&f) || f.QuadPart <= 0)
-        return 0;
-    return (uint64_t)f.QuadPart;
-#else
-    return 1000000000ull;
-#endif
-}
 
 void holly_init(void)
 {
@@ -77,9 +44,8 @@ void holly_init(void)
     last_scanline = 0;
 
     reglog = getenv("DC_HOLLYLOG") ? 3000 : 0;
-    host_frequency = ticks_per_second();
-    start_ticks = host_ticks();
-    clock_ready = host_frequency != 0;
+    clock_init();
+    tmu_init();
 
     holly_regs[(HOLLY_SPG_LOAD - HOLLY_REG_BASE) / 4u]
         = (524u << 16) | 857u;
@@ -91,9 +57,7 @@ void holly_init(void)
 // microseconds of the video clock (the AICA runs its samples off it)
 uint64_t holly_clock_us(void)
 {
-    if (!clock_ready) return 0;
-    uint64_t t = host_ticks() - start_ticks;
-    return t / host_frequency * 1000000u + t % host_frequency * 1000000u / host_frequency;
+    return clock_ns() / 1000u;
 }
 
 int holly_handles(uint32_t address)
@@ -114,22 +78,11 @@ uint32_t holly_vcount(void)
 
 uint32_t holly_scanline(void)
 {
-    if (!clock_ready || !host_frequency) return 0;
-
-    uint64_t now = host_ticks();
-    if (now < start_ticks) return 0;
-
-    uint64_t elapsed = now - start_ticks;
-
-    uint64_t frame_ticks = host_frequency / 60u;
-
-    if (!frame_ticks) return 0;
-
-    uint64_t in_frame = elapsed % frame_ticks;
+    uint64_t in_frame = clock_ns() % DC_FRAME_NS;
 
     return (uint32_t)(
         (in_frame * ((uint64_t)configured_vcount + 1u))
-        / frame_ticks
+        / DC_FRAME_NS
     );
 }
 
@@ -310,6 +263,8 @@ uint32_t sh4reg_read32(uint32_t address)
     if (!sh4reg_handles(address) || (address & 3u))
         return 0xffffffffu;
 
+    if (tmu_handles(address)) return tmu_read32(address);
+
     REGLOG("[reg] r %08x -> %08x (sh4)\n", address, sh4_regs[(address - SH4REG_BASE) / 4u]);
     return sh4_regs[(address - SH4REG_BASE) / 4u];
 }
@@ -318,6 +273,8 @@ void sh4reg_write32(uint32_t address, uint32_t value)
 {
     if (!sh4reg_handles(address) || (address & 3u))
         return;
+
+    if (tmu_handles(address)) { tmu_write32(address, value); return; }
 
     sh4_regs[(address - SH4REG_BASE) / 4u] = value;
     REGLOG("[reg] w %08x <- %08x (sh4)\n", address, value);

@@ -112,8 +112,11 @@ static int writes_reg(const sh4_insn *in, unsigned reg)
 
 /* Find the constant in `reg` just before the instruction at pc by walking
  * back through straight-line code. Follows `mov Rm,Rn` copies. Constants
- * come from mov.l/mov.w PC-relative literals, mov #imm and mova. */
-static int resolve_reg(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t *value)
+ * come from mov.l/mov.w PC-relative literals, mov #imm and mova. *from gets
+ * the address of the instruction that set it. This only looks at the code in
+ * front of pc: something may jump in after that point with a different value,
+ * which a caller that relies on the result has to rule out. */
+static int resolve_from(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t *value, uint32_t *from)
 {
     uint32_t delta = 0;   /* add #imm / @-Rn / @Rm+ steps between the source and pc */
 
@@ -129,16 +132,20 @@ static int resolve_reg(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t
         case SH4_OP_MOVL_PC:
             if (dc_literal_written(a, in.target) || !dc_read32(a->img, in.target, &v)) return 0;
             *value = v + delta;
+            *from = p;
             return 1;
         case SH4_OP_MOVW_PC:
             if (dc_literal_written(a, in.target) || !dc_read16(a->img, in.target, &w)) return 0;
             *value = (uint32_t)(int32_t)(int16_t)w + delta;
+            *from = p;
             return 1;
         case SH4_OP_MOV_I:
             *value = (uint32_t)in.imm + delta;
+            *from = p;
             return 1;
         case SH4_OP_MOVA:
             *value = in.target + delta;
+            *from = p;
             return 1;
         case SH4_OP_MOV:
             reg = in.m;   /* a copy: keep looking for Rm */
@@ -159,6 +166,12 @@ static int resolve_reg(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t
         }
     }
     return 0;
+}
+
+static int resolve_reg(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t *value)
+{
+    uint32_t from;
+    return resolve_from(a, pc, reg, value, &from);
 }
 
 int dc_literal_written(const dc_analysis *a, uint32_t addr)
@@ -698,9 +711,9 @@ const dc_func *dc_func_at(const dc_analysis *a, uint32_t addr)
     return NULL;
 }
 
-int dc_resolve_reg(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t *value)
+int dc_resolve_reg(const dc_analysis *a, uint32_t pc, unsigned reg, uint32_t *value, uint32_t *from)
 {
-    return resolve_reg(a, pc, reg, value);
+    return resolve_from(a, pc, reg, value, from);
 }
 
 int dc_jump_table(const dc_analysis *a, uint32_t func_start, uint32_t pc,

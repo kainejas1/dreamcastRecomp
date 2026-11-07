@@ -17,6 +17,7 @@ static void usage(void)
         "  dcrecomp funcs  <file> [options]   discover functions, print coverage\n"
         "  dcrecomp emit   <file> [options]   translate functions to C\n"
         "  dcrecomp selftest [-v]             check the opcode table\n"
+        "  dcrecomp interp-ops <dir>          write the interpreter's instruction table\n"
         "\n"
         "options:\n"
         "  --bin            treat file as a raw binary (e.g. 1ST_READ.BIN)\n"
@@ -30,7 +31,9 @@ static void usage(void)
         "  --setjmp ADDR    emit: the game's setjmp and longjmp, if it switches threads\n"
         "  --longjmp ADDR   with them (the runtime gives each thread a host fiber)\n"
         "  --modules LIST   emit: also code the game loads at runtime. LIST has a line\n"
-        "                   per module: NAME FILE BASE ENTRY... (tools/prs_modules.py)\n",
+        "                   per module: NAME FILE BASE ENTRY... (tools/prs_modules.py)\n"
+        "  --roots FILE     extra function starts, from a run's DC_MISSLOG. Each line\n"
+        "                   is ADDRESS MODULE ..., MODULE being main or a --modules name\n",
         DC_DEFAULT_BASE);
 }
 
@@ -44,6 +47,7 @@ typedef struct {
     uint32_t only;         /* emit */
     uint32_t setjmp_fn, longjmp_fn;   /* emit */
     const char *modules;              /* emit */
+    const char *roots;                /* DC_MISSLOG file from a run */
     struct { uint32_t dest, src, len; } copies[MAX_COPIES];
     int ncopies;
 } options;
@@ -64,6 +68,7 @@ static int parse_options(int argc, char **argv, options *o)
         else if (!strcmp(a, "--setjmp") && i + 1 < argc) o->setjmp_fn = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(a, "--longjmp") && i + 1 < argc) o->longjmp_fn = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(a, "--modules") && i + 1 < argc) o->modules = argv[++i];
+        else if (!strcmp(a, "--roots") && i + 1 < argc) o->roots = argv[++i];
         else if (!strcmp(a, "--copy") && i + 1 < argc && o->ncopies < MAX_COPIES) {
             // DEST=SRC,LEN, e.g. 0x8c000600=0x8c15ab44,0x60
             char *p = argv[++i], *end;
@@ -81,6 +86,23 @@ static int parse_options(int argc, char **argv, options *o)
     return 1;
 }
 
+// the --roots lines for one image. Uses strtok
+static int add_roots(const options *o, const char *module, dc_image *img)
+{
+    if (!o->roots) return 1;
+    FILE *f = fopen(o->roots, "r");
+    if (!f) { fprintf(stderr, "error: can't read %s\n", o->roots); return 0; }
+
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *addr = strtok(line, " \t\r\n"), *mod = strtok(NULL, " \t\r\n");
+        if (addr && mod && addr[0] != '#' && !strcmp(mod, module))
+            dc_image_add_root(img, (uint32_t)strtoul(addr, NULL, 16));
+    }
+    fclose(f);
+    return 1;
+}
+
 static int load(const options *o, dc_image *img)
 {
     char err[256];
@@ -89,7 +111,7 @@ static int load(const options *o, dc_image *img)
     for (int i = 0; ok && i < o->ncopies; i++)
         ok = dc_image_copy(img, o->copies[i].dest, o->copies[i].src, o->copies[i].len, err, sizeof err);
     if (!ok) fprintf(stderr, "error: %s\n", err);
-    return ok;
+    return ok && add_roots(o, "main", img);
 }
 
 static int cmd_disasm(const options *o)
@@ -271,6 +293,7 @@ static int emit_modules(const options *o, const dc_analysis *main_a, const dc_em
             else dc_image_add_root(&img, addr);
         }
         if (!nentries) fprintf(stderr, "emit: warning: module %s has no entry points\n", name);
+        if (!add_roots(o, name, &img)) { dc_image_free(&img); ok = 0; break; }
 
         // some modules have an odd size, analysis wants whole halfwords
         if (!dc_analyze(&a, &img, img.regions[0].start, (img.regions[0].end - img.regions[0].start + 1) & ~1u)) {
@@ -319,6 +342,8 @@ int main(int argc, char **argv)
     const char *cmd = argv[1];
     if (!strcmp(cmd, "selftest"))
         return sh4_selftest(argc > 2 && !strcmp(argv[2], "-v")) ? 0 : 1;
+    if (!strcmp(cmd, "interp-ops"))
+        return argc > 2 && dc_emit_interp(argv[2]) ? 0 : 1;
 
     options o;
     if (!parse_options(argc - 2, argv + 2, &o)) { usage(); return 2; }

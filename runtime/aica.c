@@ -1,14 +1,15 @@
 #include "aica.h"
 #include "arm7.h"
+#include "clock.h"
 #include "holly.h"
 #include "memory.h"
+#include "prof.h"
 #include "aica_chan.h"
 #include "video.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #define AICA_REG_BASE 0x00700000u
 #define AICA_REG_END  0x00708000u
@@ -59,6 +60,8 @@ static uint32_t arm_bus_r32(uint32_t addr, void *user)
 static uint8_t arm_bus_r8(uint32_t addr, void *user)
 {
     if (addr < 0x00800000u) return dc_aram[addr & (DC_ARAM_SIZE - 1)];
+    // the monitor register's low byte is the level only: reading it leaves LP set
+    if ((addr & 0x7fffu) == R_SLOT_INFO) return (uint8_t)aica_chan_info(0);
     return (uint8_t)(arm_bus_r32(addr & ~3u, user) >> ((addr & 3) * 8));
 }
 
@@ -137,7 +140,7 @@ int aica_handles(uint32_t phys)
 // the Dreamcast clock counts from 1950-01-01; unix time is 20 years (7305 days) later
 static uint32_t rtc_now(void)
 {
-    return (uint32_t)time(NULL) + 631152000u;
+    return (uint32_t)clock_unix_seconds() + 631152000u;
 }
 
 // Fake sound driver start. Katana games load Sega's manatee.drv into sound RAM
@@ -182,13 +185,17 @@ void aica_update(void)
         while (samples_done < target) {
             unsigned batch = target - samples_done > 16 ? 16 : (unsigned)(target - samples_done);
             int16_t pcm[16 * 2];
+            uint64_t t0 = clock_host_ns();
             for (unsigned i = 0; i < batch; i++) {
                 tick_sample();
                 aica_chan_sample(&pcm[i * 2]);
             }
             video_audio(pcm, (int)batch);
             update_interrupts();
+            uint64_t t1 = clock_host_ns();
+            prof_add(PROF_MIX, t0);
             arm7_run((int)batch * ARM_PER_SAMPLE);
+            prof_add(PROF_ARM, t1);
             samples_done += batch;
         }
         // DC_AICALOG=1: say when the driver takes the game's commands (port byte back to 0)
@@ -217,7 +224,7 @@ uint32_t aica_read32(uint32_t phys)
     if (phys == RTC_LO) return rtc_now() & 0xffffu;
     if (phys >= RTC_BASE) return 0;
     uint32_t off = phys - AICA_REG_BASE;
-    if (off == R_SLOT_INFO) return aica_chan_info();
+    if (off == R_SLOT_INFO) return aica_chan_info(1);
     if (off == R_SLOT_POS) return aica_chan_pos();
     return regs[off / 4];
 }
