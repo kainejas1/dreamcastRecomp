@@ -16,6 +16,7 @@
 #include "interp.h"
 #include "maple.h"
 #include "memory.h"
+#include "patches.h"
 #include "prof.h"
 #include "sh4_rt.h"
 #include "tmu.h"
@@ -328,6 +329,11 @@ void dc_service_irq(sh4_ctx *ctx)
     clock_tick(CHECK_EVERY);
     if (max_frames && holly_frame_count() >= max_frames)
         stop(ctx, "ran %u frames (DC_FRAMES), %llu interrupts taken", holly_frame_count(), interrupts);
+    static uint32_t patched_frame = ~0u;   // game patches go in once a frame
+    if (holly_frame_count() != patched_frame) {
+        patched_frame = holly_frame_count();
+        patches_frame();
+    }
     aica_update();
     video_frame();
     prof_frame(holly_frame_count());
@@ -470,6 +476,7 @@ int main(int argc, char **argv)
 
     if (getenv("DC_FRAMES")) max_frames = (uint32_t)strtoul(getenv("DC_FRAMES"), NULL, 0);
     atexit(summary);
+    patches_init();
     video_init();
     state_hash_init();
     miss_init();

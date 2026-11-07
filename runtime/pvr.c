@@ -1,6 +1,7 @@
 #include "pvr.h"
 #include "pvr_frame.h"
 #include "clock.h"
+#include "patches.h"
 #ifdef DC_GPU
 #include "gpu.h"
 #endif
@@ -64,6 +65,7 @@ typedef struct {
     pvr_modvol *m;
     int nm, capm;
     int open_m;               // modifier volume polygon taking triangles, -1 none
+    int ws_done;              // widescreen_2d has been through it
 } ta_ctx;
 
 #define MAX_CTX 4
@@ -396,6 +398,7 @@ static void list_init(void)
     cur->nv = cur->ns = 0;
     cur->nmv = cur->nm = 0;
     cur->open_m = -1;
+    cur->ws_done = 0;
     ta.list = -1;
     ta.open = -1;
     ta.nw = 0;
@@ -1337,6 +1340,40 @@ static void load_fog(void)
     }
 }
 
+// Widescreen (patches.c) widens the game's 3D view inside the 640x480 frame
+// and shows the frame stretched to 16:9, which would stretch its 2D as well.
+// So 2D polygons are pulled in toward the centre by 3/4: they keep their shape
+// and their layout from a 4:3 screen, centred. 2D here is a flat polygon (one
+// 1/w for every vertex) in the translucent list, not a sprite. With no 3D in
+// the frame (title, menus) that's all of them, backgrounds too: the screen
+// keeps its 4:3 shape (SA2's title art has the logo in it). With 3D it's the
+// HUD's layer, 0.5 and up: SA2's HUD is at 0.5-0.91, and the world's flat
+// translucent polygons (lens flares) sit under 0.1.
+static void widescreen_2d(ta_ctx *c, float centre)
+{
+    if (patches_widescreen() != 1 || c->ws_done) return;
+    c->ws_done = 1;
+    int has3d = 0;
+    for (int i = 0; i < c->ns && !has3d; i++) {
+        const strip *s = &c->s[i];
+        for (int k = 1; k < s->count && !has3d; k++)
+            has3d = !(c->v[s->first + k].z == c->v[s->first].z);
+    }
+    float zmin = has3d ? 0.5f : -INFINITY;
+    for (int i = 0; i < c->ns; i++) {
+        const strip *s = &c->s[i];
+        if (s->list != 2 || (s->pcw >> 29) == 5) continue;
+        float z = c->v[s->first].z;
+        int flat = z >= zmin;
+        for (int k = 1; k < s->count && flat; k++) flat = c->v[s->first + k].z == z;
+        if (!flat) continue;
+        for (int k = 0; k < s->count; k++) {
+            vtx *v = &c->v[s->first + k];
+            v->x = centre + (v->x - centre) * 0.75f;
+        }
+    }
+}
+
 static void render(void)
 {
     if (!nthreads) start_threads();
@@ -1369,6 +1406,7 @@ static void render(void)
     }
 
     if ((long)renders == pvrdump) dump_render(c);
+    widescreen_2d(c, (float)(clip_x0 + clip_x1 + 1) * 0.5f);
 
     load_palette();
     load_fog();

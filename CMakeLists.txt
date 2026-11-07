@@ -64,6 +64,7 @@ if(DC_GAME_SRC)
     runtime/holly.c
     runtime/maple.c
     runtime/memory.c
+    runtime/patches.c
     runtime/pvr.c
     runtime/sh4_helpers.c
     runtime/tmu.c

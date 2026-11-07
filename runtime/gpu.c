@@ -1,5 +1,6 @@
 #include "gpu.h"
 #include "holly.h"
+#include "patches.h"
 
 #include <SDL3/SDL.h>
 
@@ -355,17 +356,38 @@ static SDL_GPUTexture *get_texture(SDL_GPUCommandBuffer *cmd, uint32_t tsp, uint
 static struct target {
     uint32_t fb, frame;       // address, and the frame it was last drawn in
     int lw, lh, out_w;        // render size, and the width it is shown at
-    int scale;
+    int sx, sy;               // drawn at lw * sx by lh * sy
     SDL_GPUTexture *color, *depth;
 } targets[MAX_TARGETS];
 
-static int pick_scale(int lh)
+// the part of a w x h window the picture takes: 4:3, or 16:9 widescreen
+static void display_rect(Uint32 w, Uint32 h, Uint32 *dw, Uint32 *dh)
 {
-    if (fixed_scale > 0) return fixed_scale > 8 ? 8 : fixed_scale;
+    Uint32 num = patches_widescreen() ? 16 : 4, den = patches_widescreen() ? 9 : 3;
+    *dw = w;
+    *dh = w * den / num;
+    if (*dh > h) { *dh = h; *dw = h * num / den; }
+}
+
+static int clamp_scale(int s) { return s < 1 ? 1 : s > 8 ? 8 : s; }
+
+// Draw at least as many pixels as the picture takes in the window, across and
+// down (the blit to it only ever shrinks). Widescreen stretches the frame
+// across, so it gets more columns than rows.
+static void pick_scale(int lw, int lh, int *sx, int *sy)
+{
+    if (fixed_scale > 0) {
+        *sy = clamp_scale(fixed_scale);
+        *sx = clamp_scale(patches_widescreen() ? (fixed_scale * 4 + 2) / 3 : fixed_scale);
+        return;
+    }
     int pw = 0, ph = 0;
-    if (!win || !SDL_GetWindowSizeInPixels(win, &pw, &ph) || ph <= 0) return 1;
-    int s = (ph + lh - 1) / lh;   // at least the window's height: the blit to it only ever shrinks
-    return s < 1 ? 1 : s > 8 ? 8 : s;
+    *sx = *sy = 1;
+    if (!win || !SDL_GetWindowSizeInPixels(win, &pw, &ph) || pw <= 0 || ph <= 0) return;
+    Uint32 dw, dh;
+    display_rect((Uint32)pw, (Uint32)ph, &dw, &dh);
+    *sx = clamp_scale(((int)dw + lw - 1) / lw);
+    *sy = clamp_scale(((int)dh + lh - 1) / lh);
 }
 
 static struct target *get_target(uint32_t fb, int lw, int lh, int out_w)
@@ -376,15 +398,17 @@ static struct target *get_target(uint32_t fb, int lw, int lh, int out_w)
         if (targets[i].frame < oldest->frame || !targets[i].color) oldest = &targets[i];
     }
     if (!t) { t = oldest; t->fb = fb; t->lw = 0; }
-    int scale = pick_scale(lh);
-    if (!t->color || t->lw != lw || t->lh != lh || t->scale != scale) {
+    int sx, sy;
+    pick_scale(lw, lh, &sx, &sy);
+    if (!t->color || t->lw != lw || t->lh != lh || t->sx != sx || t->sy != sy) {
         if (t->color) SDL_ReleaseGPUTexture(dev, t->color);
         if (t->depth) SDL_ReleaseGPUTexture(dev, t->depth);
-        t->color = texture(lw * scale, lh * scale, FORMAT, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
-        t->depth = texture(lw * scale, lh * scale, depth_format, SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
+        t->color = texture(lw * sx, lh * sy, FORMAT, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        t->depth = texture(lw * sx, lh * sy, depth_format, SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
         t->lw = lw;
         t->lh = lh;
-        t->scale = scale;
+        t->sx = sx;
+        t->sy = sy;
     }
     t->out_w = out_w;
     t->frame = holly_frame_count();
@@ -629,10 +653,10 @@ void gpu_render(const pvr_frame *f)
     };
     SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(cmd, &ct, 1, &dt);
     if (nd || has_mv) {
-        int sc = t->scale;
-        SDL_GPUViewport vp = { 0, 0, (float)(f->width * sc), (float)(f->height * sc), 0, 1 };
+        int sx = t->sx, sy = t->sy;
+        SDL_GPUViewport vp = { 0, 0, (float)(f->width * sx), (float)(f->height * sy), 0, 1 };
         SDL_SetGPUViewport(rp, &vp);
-        SDL_Rect clip = { f->clip_x0 * sc, f->clip_y0 * sc, (f->clip_x1 - f->clip_x0 + 1) * sc, (f->clip_y1 - f->clip_y0 + 1) * sc };
+        SDL_Rect clip = { f->clip_x0 * sx, f->clip_y0 * sy, (f->clip_x1 - f->clip_x0 + 1) * sx, (f->clip_y1 - f->clip_y0 + 1) * sy };
         SDL_SetGPUScissor(rp, &clip);
         float screen[4] = { 2.0f / (float)f->width, 2.0f / (float)f->height, DEPTH_SCALE, 0 };
         SDL_PushGPUVertexUniformData(cmd, 0, screen, sizeof screen);
@@ -727,7 +751,7 @@ static struct target *shown(uint32_t fb)
     return NULL;
 }
 
-// blit w x h of src into the window, as large as fits at 4:3
+// blit w x h of src into the window, as large as fits at 4:3 (16:9 widescreen)
 static void to_window(SDL_GPUTexture *src, int w, int h)
 {
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
@@ -738,8 +762,8 @@ static void to_window(SDL_GPUTexture *src, int w, int h)
         SDL_SubmitGPUCommandBuffer(cmd);   // minimised, or too many frames in flight: skip this one
         return;
     }
-    Uint32 dw = sw_w, dh = sw_w * 3 / 4;
-    if (dh > sw_h) { dh = sw_h; dw = sw_h * 4 / 3; }
+    Uint32 dw, dh;
+    display_rect(sw_w, sw_h, &dw, &dh);
     SDL_GPUBlitInfo bi = {
         .source = { .texture = src, .w = (Uint32)w, .h = (Uint32)h },
         .destination = { .texture = sw, .x = (sw_w - dw) / 2, .y = (sw_h - dh) / 2, .w = dw, .h = dh },
@@ -756,7 +780,7 @@ int gpu_present(uint32_t fb)
     if (!active || !win) return active;
     struct target *t = shown(fb);
     if (!t) return 0;
-    to_window(t->color, t->lw * t->scale, t->lh * t->scale);
+    to_window(t->color, t->lw * t->sx, t->lh * t->sy);
     return 1;
 }
 
@@ -784,9 +808,11 @@ int gpu_read(uint32_t fb, uint32_t **pixels, int *w, int *h)
     if (!active) return 0;
     struct target *t = shown(fb);
     if (!t) return 0;
-    // native size (what VRAM would hold), or with DC_SHOTFULL=1 everything rendered
+    // native size (what VRAM would hold), or with DC_SHOTFULL=1 everything
+    // rendered; widescreen frames come out stretched to 16:9, as shown
     int full = getenv("DC_SHOTFULL") != NULL;
-    int ow = full ? t->lw * t->scale : t->out_w, oh = full ? t->lh * t->scale : t->lh;
+    int oh = full ? t->lh * t->sy : t->lh;
+    int ow = patches_widescreen() ? (oh * 16 + 4) / 9 : full ? t->lw * t->sx : t->out_w;
     SDL_GPUTexture *small = texture(ow, oh, FORMAT, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
     SDL_GPUTransferBufferCreateInfo ti = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = (Uint32)(ow * oh * 4) };
     SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(dev, &ti);
@@ -794,7 +820,7 @@ int gpu_read(uint32_t fb, uint32_t **pixels, int *w, int *h)
     int ok = 0;
     if (small && tb && cmd) {
         SDL_GPUBlitInfo bi = {
-            .source = { .texture = t->color, .w = (Uint32)(t->lw * t->scale), .h = (Uint32)(t->lh * t->scale) },
+            .source = { .texture = t->color, .w = (Uint32)(t->lw * t->sx), .h = (Uint32)(t->lh * t->sy) },
             .destination = { .texture = small, .w = (Uint32)ow, .h = (Uint32)oh },
             .load_op = SDL_GPU_LOADOP_DONT_CARE,
             .filter = SDL_GPU_FILTER_LINEAR,

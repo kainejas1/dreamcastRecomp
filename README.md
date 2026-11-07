@@ -40,6 +40,7 @@ stays on your machine (`extracted/` and `out/` are ignored by git).
 - modifier volumes: shadows under characters and cars, in both renderers
 - translucency sorted by depth, as the PVR does (lens flares, Story Select's cards)
 - fog (table and per-vertex) in both renderers; the game's own mip levels on the GPU
+- widescreen (`DC_WIDESCREEN=1`): 16:9 stages, HUD and menus kept at their 4:3 shape
 - next: the GPU's share of translucent modifier volumes, two-volume polygons
 
 ## Build
@@ -81,7 +82,7 @@ that in mind when a bug looks like bad data.
 
 Debug switches: `DC_FRAMES=n`, `DC_DUMP=file`, `DC_SHOT=file.png`, `DC_NOWINDOW=1`,
 `DC_HOLLYLOG=1`, `DC_IRQLOG=n`, `DC_BIOSLOG=n`, `DC_AICALOG=1`, `DC_AICACHLOG=n`, `DC_COROLOG=n`,
-`DC_HWSTOP=828c`, `DC_PROF=n`, `DC_RENDER_THREADS=n`, `DC_RENDERER=gpu|soft`, `DC_SCALE=n`, `DC_SHOTFULL=1`, `DC_PVRLOG=n`, `DC_PVRDUMP=n` (with `DC_TEXDUMP=tcw`), `DC_MAPLELOG=n`, `DC_FAKEDRIVER=1`, `DC_WAV=file`, `DC_VMU=file`, `DC_PRESS=600:start,...`, and `-DDC_TRACE=ON` with `DC_TRACELOG=n`.
+`DC_HWSTOP=828c`, `DC_PROF=n`, `DC_RENDER_THREADS=n`, `DC_RENDERER=gpu|soft`, `DC_SCALE=n`, `DC_SHOTFULL=1`, `DC_WIDESCREEN=1|2`, `DC_PVRLOG=n`, `DC_PVRDUMP=n` (with `DC_TEXDUMP=tcw`), `DC_MAPLELOG=n`, `DC_FAKEDRIVER=1`, `DC_WAV=file`, `DC_VMU=file`, `DC_PRESS=600:start,...`, and `-DDC_TRACE=ON` with `DC_TRACELOG=n`.
 
 ## Code the analysis missed
 
@@ -173,6 +174,22 @@ Not drawn yet: the second colours of two-volume polygons, mip levels in the
 software renderer, and on the GPU the translucent list's modifier volumes and
 per-pixel sorting. Per-tile pre-sort flags in the region array are ignored (only
 `ISP_FEED_CFG` decides).
+
+## Widescreen
+
+`DC_WIDESCREEN=1` plays SA2 (USA, MK-51117) at 16:9. `runtime/patches.c` writes
+two values into the game's screen setup block once a frame, the same pair as
+Flycast's widescreen cheat: the projection's width 640 becomes 480 and its
+aspect 1.0 becomes 0.75. The game then fits 4/3 as much view across its
+640x480 frame, and the frame is shown stretched to 16:9, so 3D comes out at
+the right proportions with more to either side. It works in both renderers;
+the GPU draws more columns than rows to make up for the stretch.
+
+The stretch would widen 2D as well, so `pvr.c` pulls 2D polygons back in by
+3/4 toward the centre: on screens without 3D (title, menus) all of them, which
+keeps those screens 4:3 with bars at the sides; in stages the HUD's layer
+(flat translucent polygons at z 0.5 and up). `DC_WIDESCREEN=2` leaves 2D
+stretched instead.
 
 ## Speed
 

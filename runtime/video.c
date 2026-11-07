@@ -4,6 +4,7 @@
 #include "pvr.h"
 #include "pvr_frame.h"
 #include "clock.h"
+#include "patches.h"
 #ifdef DC_GPU
 #include "gpu.h"
 #endif
@@ -264,7 +265,8 @@ void video_frame(void)
             texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
             tex_w = w;
             tex_h = h;
-            SDL_SetRenderLogicalPresentation(renderer, 640, 480, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+            // 4:3, or 16:9 with the widescreen patch (the frame stretched)
+            SDL_SetRenderLogicalPresentation(renderer, patches_widescreen() ? 853 : 640, 480, SDL_LOGICAL_PRESENTATION_LETTERBOX);
         }
         if (texture) {
             SDL_UpdateTexture(texture, NULL, pixels, w * 4);
