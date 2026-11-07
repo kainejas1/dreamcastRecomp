@@ -103,21 +103,30 @@ static void packed(uint32_t c, float *out)
     out[3] = (c >> 24) / 255.0f;
 }
 
+// The TA keeps colours as 8 bits a channel: floats saturate to 0..1 on the way
+// in (NaN to 1, as Flycast's float_to_satu8). Games send intensities and
+// colours outside 0..1 on purpose (SA2's shiny objects: offset intensities
+// below 0), relying on that.
+static uint8_t satu8(float v)
+{
+    return v == v ? (uint8_t)(fminf(1.0f, fmaxf(0.0f, v)) * 255.0f) : 255;
+}
+
 // float A, R, G, B at w
 static void argb_f(const uint32_t *w, float *out)
 {
-    out[0] = as_float(w[1]);
-    out[1] = as_float(w[2]);
-    out[2] = as_float(w[3]);
-    out[3] = as_float(w[0]);
+    out[0] = satu8(as_float(w[1])) / 255.0f;
+    out[1] = satu8(as_float(w[2])) / 255.0f;
+    out[2] = satu8(as_float(w[3])) / 255.0f;
+    out[3] = satu8(as_float(w[0])) / 255.0f;
 }
 
+// a face colour (8-bit, from the header) times a vertex's intensity, also
+// saturated to 8 bits, over 256; alpha takes no intensity
 static void intensity(uint32_t i, const float *face, float *out)
 {
-    float k = as_float(i);
-    out[0] = face[0] * k;
-    out[1] = face[1] * k;
-    out[2] = face[2] * k;
+    unsigned k = satu8(as_float(i));
+    for (int c = 0; c < 3; c++) out[c] = (float)((unsigned)(face[c] * 255.0f + 0.5f) * k / 256u) / 255.0f;
     out[3] = face[3];
 }
 
@@ -1263,6 +1272,25 @@ static void dump_render(const ta_ctx *c)
     FILE *f = fopen("pvr_dump.txt", "w");
     if (!f) return;
     fprintf(f, "fpu_shad_scale %08x\n", holly_reg(PVR_FPU_SHAD_SCALE));
+    // DC_TEXDUMP=tcw (hex): that texture decoded, as raw ARGB8888 in tex_<tcw>_<w>x<h>.raw
+    const char *td = getenv("DC_TEXDUMP");
+    for (int i = 0; td && i < c->ns; i++) {
+        const strip *s = &c->s[i];
+        if (s->tcw != (uint32_t)strtoul(td, NULL, 16) || !((s->isp >> 25) & 1)) continue;
+        int w, h;
+        pvr_texture_size(s->tsp, &w, &h);
+        uint32_t *px = malloc((size_t)w * h * 4);
+        char name[64];
+        snprintf(name, sizeof name, "tex_%08x_%dx%d.raw", s->tcw, w, h);
+        FILE *t = fopen(name, "wb");
+        if (px && t) {
+            pvr_texture_decode(s->tsp, s->tcw, px);
+            fwrite(px, 4, (size_t)w * h, t);
+        }
+        if (t) fclose(t);
+        free(px);
+        break;
+    }
     fprintf(f, "fog col_ram %08x col_vert %08x density %08x clamp_max %08x clamp_min %08x\n", holly_reg(PVR_FOG_COL_RAM),
             holly_reg(PVR_FOG_COL_VERT), holly_reg(PVR_FOG_DENSITY), holly_reg(PVR_FOG_CLAMP_MAX), holly_reg(PVR_FOG_CLAMP_MIN));
     fprintf(f, "fog table");
@@ -1284,8 +1312,8 @@ static void dump_render(const ta_ctx *c)
         fprintf(f, "strip %d list %d pcw %08x isp %08x tsp %08x tcw %08x count %d\n", i, s->list, s->pcw, s->isp, s->tsp, s->tcw, s->count);
         for (int k = 0; k < s->count; k++) {
             const vtx *v = &c->v[s->first + k];
-            fprintf(f, "  %12g %12g %12g  uv %9g %9g  col %.2f %.2f %.2f %.2f\n", v->x, v->y, v->z, v->u, v->v,
-                    v->col[0], v->col[1], v->col[2], v->col[3]);
+            fprintf(f, "  %12g %12g %12g  uv %9g %9g  col %.2f %.2f %.2f %.2f  off %.2f %.2f %.2f %.2f\n", v->x, v->y, v->z,
+                    v->u, v->v, v->col[0], v->col[1], v->col[2], v->col[3], v->off[0], v->off[1], v->off[2], v->off[3]);
         }
     }
     fclose(f);
